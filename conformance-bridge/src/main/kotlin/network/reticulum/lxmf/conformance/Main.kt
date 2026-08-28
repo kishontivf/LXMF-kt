@@ -772,8 +772,8 @@ private fun cmdLxmfGetMessageState(params: JSONObject): JSONObject {
  * the msgpack/payload parsing layer directly, against payload shapes
  * that may be impossible to elicit through normal send commands (e.g.
  * a fields slot encoded as msgpack Nil, which kotlin's own sender never
- * emits but iOS LXMF does — and which kotlin's decoder used to throw on,
- * silently dropping every iOS-originated message).
+ * emits but other LXMF implementations do — and which kotlin's decoder
+ * used to throw on, silently dropping every message from such a sender).
  *
  * Mirrors lxmf_python.py::cmd_lxmf_decode_bytes.
  *
@@ -801,7 +801,7 @@ private fun cmdLxmfDecodeBytes(params: JSONObject): JSONObject {
     // command — to exercise the actual LXMessage.unpackFromBytes code path
     // that runs in the wild, not a parallel re-implementation. A bridge
     // that re-implemented decode here would silently mask production
-    // decoder bugs (e.g. the iOS-Nil-fields landmine that took weeks to
+    // decoder bugs (e.g. the Nil-fields landmine that took weeks to
     // find precisely because the conformance suite couldn't reach the
     // production code path).
     val msg = network.reticulum.lxmf.LXMessage.unpackFromBytes(lxmfBytes)

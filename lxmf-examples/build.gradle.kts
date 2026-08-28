@@ -6,8 +6,8 @@ plugins {
 val coroutinesVersion: String by project
 
 dependencies {
-    implementation("com.github.torlando-tech.reticulum-kt:rns-core:v0.0.3")
-    implementation("com.github.torlando-tech.reticulum-kt:rns-interfaces:v0.0.3")
+    implementation("com.github.kishontivf.reticulum-kt:rns-core:0.1.0")
+    implementation("com.github.kishontivf.reticulum-kt:rns-interfaces:0.1.0")
     implementation(project(":lxmf-core"))
 
     // Coroutines

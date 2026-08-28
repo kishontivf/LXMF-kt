@@ -112,7 +112,7 @@ class LxmfSender(
 
         Thread.sleep(1000) // Wait for connection
 
-        if (!tcpClient.online.get()) {
+        if (!tcpClient.online.value) {
             log("ERROR: Could not connect to $targetHost:$targetPort")
             System.exit(1)
         }

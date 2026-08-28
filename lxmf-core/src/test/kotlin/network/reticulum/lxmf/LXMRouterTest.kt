@@ -16,6 +16,7 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -190,16 +191,28 @@ class LXMRouterTest {
 
         // handleOutbound() also launches an async processOutbound() via
         // triggerProcessing(); the synchronous call below races it for
-        // outboundProcessingMutex. Poll until at least one attempt has
-        // been recorded — same deflake pattern as the sibling test
-        // "test direct delivery method increments attempts".
+        // outboundProcessingMutex. Poll until the message has been scheduled,
+        // which is what a pass over it now leaves behind.
         withTimeout(5_000) {
-            while (message.deliveryAttempts == 0) {
+            while (message.nextDeliveryAttempt == null) {
                 delay(50)
                 router.processOutbound()
             }
         }
-        assertTrue(message.deliveryAttempts > 0)
+
+        // There is no path to this freshly-created identity, so nothing was
+        // transmitted — and an attempt now counts transmissions only. Billing
+        // this made MAX_OUTBOUND_AGE unreachable in exactly the case it exists
+        // for: a message queued while the radio was down burned its whole
+        // budget in minutes and was discarded before the device recovered.
+        assertEquals(0, message.deliveryAttempts)
+
+        // Rescheduled off the backoff curve rather than a flat wait.
+        val wait = message.nextDeliveryAttempt!! - System.currentTimeMillis()
+        assertTrue(
+            wait <= RetryBackoff.afterStep(0),
+            "a first pathless retry should be scheduled within the base backoff, was $wait ms",
+        )
     }
 
     @Test
@@ -309,14 +322,15 @@ class LXMRouterTest {
         // poll until at least one attempt has been recorded — same
         // deflake pattern test_max_delivery_attempts uses.
         withTimeout(5_000) {
-            while (message.deliveryAttempts == 0) {
+            while (message.nextDeliveryAttempt == null) {
                 delay(50)
                 router.processOutbound()
             }
         }
 
-        // Direct delivery without path/link should have incremented attempts
-        assertTrue(message.deliveryAttempts >= 1)
+        // Direct delivery with no path attempts no link, so it bills nothing.
+        // The increment moved inside the has-path branch to make that true.
+        assertEquals(0, message.deliveryAttempts)
     }
 
     @Test
@@ -355,7 +369,7 @@ class LXMRouterTest {
     }
 
     @Test
-    fun `test max delivery attempts results in failure`() = runBlocking {
+    fun `test a spent delivery budget parks the message instead of failing it`() = runBlocking {
         val destIdentity = Identity.create()
 
         val sourceDestination = Destination.create(
@@ -382,9 +396,9 @@ class LXMRouterTest {
             desiredMethod = DeliveryMethod.DIRECT
         )
 
-        // The primary fix in this PR is invoking failedCallback on every
-        // FAILED transition. Capture invocation so a future regression
-        // that drops the call again breaks loudly here.
+        // Spending the budget must NOT fail the message any more, so this
+        // records the opposite of what it used to: a fired callback is now the
+        // regression. MAX_OUTBOUND_AGE is the only thing that gives up.
         val callbackFired = java.util.concurrent.atomic.AtomicBoolean(false)
         message.failedCallback = { callbackFired.set(true) }
 
@@ -407,25 +421,30 @@ class LXMRouterTest {
         // assertion isn't ordering-dependent.
         router.processOutbound()
         withTimeout(5_000) {
-            while (message.state != MessageState.FAILED &&
-                message.state != MessageState.DELIVERED
-            ) {
-                // Post-fix, the no-link branch defers failure to the next *due*
-                // tick (Python parity: bump to MAX+1, set nextDeliveryAttempt =
-                // +DELIVERY_RETRY_WAIT, then the next tick's top-of-function check
-                // fails it) instead of failing inline. Force each tick due so the
-                // message isn't gated behind the retry-wait for the whole timeout.
+            while (message.deliveryAttempts == LXMRouter.MAX_DELIVERY_ATTEMPTS) {
                 message.nextDeliveryAttempt = 0L
                 delay(50)
                 router.processOutbound()
             }
         }
 
-        // Should be FAILED after exceeding max attempts
-        assertEquals(MessageState.FAILED, message.state)
-        assertTrue(
+        // Eight unproven sends says the ROUTE is not delivering, not that the
+        // message is undeliverable — routinely a stale multi-hop entry pointing
+        // away from a peer that is one hop away on another carrier. So the path
+        // is thrown away and the budget resets for whatever replaces it.
+        assertEquals(0, message.deliveryAttempts)
+        assertEquals(MessageState.OUTBOUND, message.state)
+
+        assertFalse(
             callbackFired.get(),
-            "failedCallback must be invoked on FAILED transition (the primary fix)",
+            "a spent route budget must not fail the message; only MAX_OUTBOUND_AGE does",
+        )
+
+        // Parked, not abandoned: released early once a path exists again.
+        val wait = message.nextDeliveryAttempt!! - System.currentTimeMillis()
+        assertTrue(
+            wait > 0 && wait <= LXMRouter.UNPROVEN_ROUTE_RETRY_WAIT,
+            "the message should be parked for at most UNPROVEN_ROUTE_RETRY_WAIT, was $wait ms",
         )
     }
 

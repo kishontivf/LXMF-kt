@@ -88,7 +88,7 @@ class PropagationSyncTest {
 
         // Wait for connection to establish
         Thread.sleep(500)
-        println("Connected to TCP $TCP_HOST:$TCP_PORT (online=${tcpClient.online.get()})")
+        println("Connected to TCP $TCP_HOST:$TCP_PORT (online=${tcpClient.online.value})")
 
         // Create LXMF router
         router = LXMRouter()
