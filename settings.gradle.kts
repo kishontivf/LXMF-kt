@@ -9,13 +9,15 @@ pluginManagement {
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.PREFER_PROJECT)
     repositories {
-        // Local-iteration override: when the env var is set, mavenLocal
-        // is consulted first so a `./gradlew :rns-core:publishToMavenLocal`
-        // in a sibling reticulum-kt checkout is picked up without going
-        // through JitPack. No-op when unset. Mirrors the dev-loop pattern
-        // documented in Columba's settings.gradle.kts.
-        if (System.getenv("LOCAL_RETICULUM_KT_VIA_MAVEN_LOCAL") != null) {
-            mavenLocal()
+        // This is a fork, and it builds against OUR reticulum-kt fork rather than upstream's
+        // published tags: the two diverge together, and a diagnostic added to one is used by the
+        // other. `./gradlew publishToMavenLocal` in the reticulum-kt-kishontivf checkout is what
+        // puts it here. Scoped to that group so nothing else resolves out of a directory whose
+        // contents are whatever was last built.
+        mavenLocal {
+            content {
+                includeGroupByRegex("com\\.github\\.torlando-tech.*")
+            }
         }
         google()
         mavenCentral()

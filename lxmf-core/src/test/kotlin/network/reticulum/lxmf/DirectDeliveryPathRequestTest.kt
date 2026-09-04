@@ -22,6 +22,7 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 /**
@@ -224,31 +225,36 @@ class DirectDeliveryPathRequestTest {
     }
 
     @Test
-    @DisplayName("pathless direct retries re-request the path each attempt until FAILED")
-    fun pathlessRetriesUntilMax() = runBlocking {
+    @DisplayName("pathless direct retries re-request the path on every pass and never fail")
+    fun pathlessRetriesKeepAsking() = runBlocking {
         val (message, dest) = directMessage(Identity.create())
         var failedCount = 0
         message.failedCallback = { failedCount++ }
 
         router.handleOutbound(message)
 
-        // Each increment of deliveryAttempts to [1, MAX-1] issues exactly one
-        // path request; the count is independent of tick timing. Force each
-        // attempt due so we don't sleep out PATH_REQUEST_WAIT/DELIVERY_RETRY_WAIT.
-        withTimeout(15_000) {
-            while (message.state != MessageState.FAILED) {
-                message.nextDeliveryAttempt = 0L
-                router.processOutbound()
-                delay(15)
-            }
+        // Every pass over a pathless message issues exactly one path request —
+        // the columba#1004 fix, and the part of it that has not changed. Force
+        // each pass due so we don't sleep out the backoff.
+        val passes = LXMRouter.MAX_DELIVERY_ATTEMPTS + 2
+        repeat(passes) {
+            message.nextDeliveryAttempt = 0L
+            router.processOutbound()
+            delay(15)
         }
 
         assertEquals(
-            LXMRouter.MAX_DELIVERY_ATTEMPTS - 1,
+            passes,
             pathRequestCountFor(dest.hash),
-            "one path request per pathless attempt below MAX",
+            "one path request per pathless pass",
         )
-        assertEquals(1, failedCount, "failedCallback invoked exactly once")
+
+        // What has changed: a pathless pass transmits nothing, so it bills no
+        // attempt, so the budget is never spent and the message is never
+        // abandoned for want of a route it was still asking for.
+        assertEquals(0, message.deliveryAttempts, "a pathless pass must not bill an attempt")
+        assertEquals(0, failedCount, "only MAX_OUTBOUND_AGE may fail a message")
+        assertNotEquals(MessageState.FAILED, message.state)
     }
 
     @Test

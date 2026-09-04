@@ -8,13 +8,11 @@ val coroutinesVersion: String by project
 
 dependencies {
     implementation(project(":lxmf-core"))
-    // Match the rns-core/rns-interfaces version :lxmf-core depends on.
-    // Was pinned to v0.0.3 — stale; lxmf-core has been on v0.0.14 since
-    // the rns-core bump in lxmf-core/build.gradle.kts:23. Mismatch caused
-    // the bridge to ship an older Resource implementation than what the
-    // tests against the bridge actually exercise.
-    implementation("com.github.torlando-tech.reticulum-kt:rns-core:main-SNAPSHOT")
-    implementation("com.github.torlando-tech.reticulum-kt:rns-interfaces:main-SNAPSHOT")
+    // Must match the rns-core/rns-interfaces version :lxmf-core depends on. A mismatch here
+    // ships the bridge an older Resource implementation than the tests running against it
+    // exercise, which has bitten this module before — so these move with lxmf-core, always.
+    implementation("com.github.kishontivf.reticulum-kt:rns-core:0.1.0")
+    implementation("com.github.kishontivf.reticulum-kt:rns-interfaces:0.1.0")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutinesVersion")
     implementation("org.json:json:20231013")

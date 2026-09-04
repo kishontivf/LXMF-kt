@@ -21,6 +21,8 @@ class LXMessageTest {
         assertEquals(64, LXMFConstants.SIGNATURE_LENGTH)
         assertEquals(112, LXMFConstants.LXMF_OVERHEAD)
         assertEquals(295, LXMFConstants.ENCRYPTED_PACKET_MAX_CONTENT)
+        // Held at the agreed figure rather than derived; see the constant's KDoc.
+        assertEquals(303, LXMFConstants.ENCRYPTED_PACKET_MAX_PAYLOAD)
         assertEquals(319, LXMFConstants.LINK_PACKET_MAX_CONTENT)
 
         // Field identifiers
@@ -65,6 +67,71 @@ class LXMessageTest {
             destHash = sourceDestination.hash,
             publicKey = sourceIdentity.getPublicKey()
         )
+    }
+
+    /**
+     * Where a message stops fitting in one packet, pinned because every client we ship has to
+     * answer it identically.
+     *
+     * The number is not derived, it is agreed: eight bytes below what the MDU allows, so that the
+     * same message never takes a link on one device and a single packet on another. A change here
+     * that is not also made in the other clients is the bug this test exists to catch.
+     */
+    @Test
+    fun `pack should stop choosing opportunistic past the agreed packed size`() {
+        // given
+        val (source, destination) = pair()
+
+        var lastOpportunistic: LXMessage? = null
+        var firstDirect: LXMessage? = null
+
+        // when
+        // Grown a byte at a time rather than calculated: msgpack's own length prefixes mean a
+        // content length does not map onto a packed size a test can predict, and the transition
+        // is the thing being pinned rather than any particular content.
+        for (length in 250..450) {
+            val message = LXMessage.create(
+                destination = destination,
+                source = source,
+                content = "x".repeat(length),
+                desiredMethod = DeliveryMethod.OPPORTUNISTIC,
+            )
+
+            message.pack()
+
+            if (message.packedSize <= MAX_OPPORTUNISTIC_PACKED) {
+                lastOpportunistic = message
+            } else if (firstDirect == null) {
+                firstDirect = message
+            }
+        }
+
+        // then
+        assertNotNull(lastOpportunistic)
+        assertNotNull(firstDirect)
+        assertEquals(DeliveryMethod.OPPORTUNISTIC, lastOpportunistic.method)
+        assertEquals(DeliveryMethod.DIRECT, firstDirect.method)
+    }
+
+    /** A source and a destination, which every packed message needs and none of these tests vary. */
+    private fun pair(): Pair<Destination, Destination> {
+        val source = Destination.create(
+            identity = Identity.create(),
+            direction = DestinationDirection.IN,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery",
+        )
+
+        val destination = Destination.create(
+            identity = Identity.create(),
+            direction = DestinationDirection.OUT,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery",
+        )
+
+        return source to destination
     }
 
     @Test
@@ -359,5 +426,18 @@ class LXMessageTest {
         )
         largeMessage.pack()
         assertEquals(MessageRepresentation.RESOURCE, largeMessage.representation)
+    }
+
+    private companion object {
+
+        /**
+         * The largest packed message that may still go in one packet:
+         * [LXMFConstants.ENCRYPTED_PACKET_MAX_PAYLOAD] plus the two destination hashes and the
+         * signature the opportunistic expression subtracts.
+         */
+        const val MAX_OPPORTUNISTIC_PACKED =
+            LXMFConstants.ENCRYPTED_PACKET_MAX_PAYLOAD +
+                2 * LXMFConstants.DESTINATION_LENGTH +
+                LXMFConstants.SIGNATURE_LENGTH
     }
 }

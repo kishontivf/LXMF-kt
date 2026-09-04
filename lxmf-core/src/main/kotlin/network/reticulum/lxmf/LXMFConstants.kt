@@ -256,8 +256,32 @@ object LXMFConstants {
     /**
      * Maximum content for encrypted single-packet message (295 bytes).
      * Calculated as: encrypted MDU - LXMF overhead + destination hash (inferred)
+     *
+     * No longer decides whether a message may go opportunistically — see
+     * [ENCRYPTED_PACKET_MAX_PAYLOAD] for why that moved.
      */
     const val ENCRYPTED_PACKET_MAX_CONTENT = 295
+
+    /**
+     * The ceiling for an opportunistic send: the packed message less the two destination hashes
+     * and the signature. The effective limit is therefore a packed size of 399 bytes.
+     *
+     * **Deliberately eight bytes below what the MDU allows, and that is a decision rather than a
+     * derivation.** From the same MDU of 391, an opportunistic send puts
+     * `packed[DESTINATION_LENGTH:]` on the wire, which makes the derived ceiling a packed size of
+     * 407 — exactly what [ENCRYPTED_PACKET_MAX_CONTENT] measured against [LXMF_OVERHEAD] gives,
+     * and what this implementation used before.
+     *
+     * We hold every client we ship to one conservative figure instead. Disagreeing about a message
+     * of 400 to 407 bytes costs nothing on the wire: the shorter side sends it over a link rather
+     * than in one packet, which is slower and never wrong. What it costs is that the same message
+     * takes a different path depending on which device sent it, which makes a report from the
+     * field impossible to read. Agreement is worth more than the eight bytes.
+     *
+     * **Only ever change this in lockstep across the clients** — the number has no meaning of its
+     * own beyond keeping them aligned.
+     */
+    const val ENCRYPTED_PACKET_MAX_PAYLOAD = 303
 
     /**
      * Maximum content for link-based single-packet message (319 bytes).

@@ -257,7 +257,7 @@ class LxmfNode(
         }
         val pendingCount = runBlocking { router.pendingOutboundCount() }
         println("  Pending outbound: $pendingCount")
-        println("  UDP Interface: ${if (udpInterface.online.get()) "online" else "offline"}")
+        println("  UDP Interface: ${if (udpInterface.online.value) "online" else "offline"}")
         println("-".repeat(40))
         println()
     }

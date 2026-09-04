@@ -7,6 +7,7 @@ import network.reticulum.identity.Identity
 import org.msgpack.core.MessagePack
 import java.io.ByteArrayOutputStream
 import java.util.Base64
+import network.reticulum.common.RnsLog
 
 /**
  * LXMF Message class.
@@ -313,6 +314,13 @@ class LXMessage private constructor(
     private fun determineDeliveryMethod() {
         val contentSize = packed!!.size - LXMFConstants.LXMF_OVERHEAD
 
+        // Measured differently from `contentSize`, and only for the opportunistic decision. The
+        // expression is fixed by [LXMFConstants.ENCRYPTED_PACKET_MAX_PAYLOAD], which every client
+        // holds to one value so that a given message never takes a link on one device and a single
+        // packet on another.
+        val opportunisticPayloadSize =
+            packed!!.size - (2 * LXMFConstants.DESTINATION_LENGTH + LXMFConstants.SIGNATURE_LENGTH)
+
         // Default to DIRECT if not specified
         if (desiredMethod == null) {
             desiredMethod = DeliveryMethod.DIRECT
@@ -320,9 +328,9 @@ class LXMessage private constructor(
 
         when (desiredMethod) {
             DeliveryMethod.OPPORTUNISTIC -> {
-                if (contentSize > LXMFConstants.ENCRYPTED_PACKET_MAX_CONTENT) {
+                if (opportunisticPayloadSize > LXMFConstants.ENCRYPTED_PACKET_MAX_PAYLOAD) {
                     // Fall back to DIRECT for large messages
-                    println("Opportunistic delivery requested but content too large ($contentSize bytes), falling back to DIRECT")
+                    RnsLog.debug("LXMessage") { "Opportunistic delivery requested but content too large ($opportunisticPayloadSize bytes), falling back to DIRECT" }
                     desiredMethod = DeliveryMethod.DIRECT
                     method = DeliveryMethod.DIRECT
                     representation =
@@ -681,7 +689,7 @@ class LXMessage private constructor(
                 // Minimum size: dest_hash (16) + source_hash (16) + signature (64) + some payload
                 val minHeaderSize = 2 * LXMFConstants.DESTINATION_LENGTH + LXMFConstants.SIGNATURE_LENGTH
                 if (lxmfBytes.size <= minHeaderSize) {
-                    println("LXMF message too small: ${lxmfBytes.size} bytes (need > $minHeaderSize)")
+                    RnsLog.debug("LXMessage") { "LXMF message too small: ${lxmfBytes.size} bytes (need > $minHeaderSize)" }
                     return null
                 }
 
@@ -708,7 +716,7 @@ class LXMessage private constructor(
                 val arraySize = unpacker.unpackArrayHeader()
 
                 if (arraySize < 4) {
-                    println("Invalid LXMF payload: expected at least 4 elements, got $arraySize")
+                    RnsLog.warn("LXMessage") { "Invalid LXMF payload: expected at least 4 elements, got $arraySize" }
                     return null
                 }
 
@@ -725,8 +733,8 @@ class LXMessage private constructor(
                 val contentBytes = ByteArray(contentLen)
                 unpacker.readPayload(contentBytes)
 
-                // [3] fields — may be msgpack Nil (interop: iOS LXMF and python's
-                // `set_fields(None)` both produce Nil here; python tolerates this on
+                // [3] fields — may be msgpack Nil (interop: other LXMF implementations and
+                // python's `set_fields(None)` both produce Nil here; python tolerates this on
                 // unpack via LXMessage.py:755 + set_fields() at LXMessage.py:220-224
                 // which accepts None and normalizes to {}). Track wire encoding so
                 // we can repack identically when a stamp is present.
@@ -826,17 +834,17 @@ class LXMessage private constructor(
                         }
                     } catch (e: Exception) {
                         message.signatureValidated = false
-                        println("Error validating LXMF signature: ${e.message}")
+                        RnsLog.error("LXMessage") { "Error validating LXMF signature: ${e.message}" }
                     }
                 } else {
                     message.signatureValidated = false
                     message.unverifiedReason = UnverifiedReason.SOURCE_UNKNOWN
-                    println("Cannot validate LXMF signature: source identity unknown")
+                    RnsLog.error("LXMessage") { "Cannot validate LXMF signature: source identity unknown" }
                 }
 
                 return message
             } catch (e: Exception) {
-                println("Error unpacking LXMF message: ${e.message}")
+                RnsLog.error("LXMessage") { "Error unpacking LXMF message: ${e.message}" }
                 e.printStackTrace()
                 return null
             }
@@ -915,7 +923,7 @@ class LXMessage private constructor(
          *
          * [fieldsWasNil] preserves the original wire encoding for the fields
          * position. If the inbound payload encoded fields as msgpack Nil
-         * (`0xc0`, what iOS LXMF and python's `msgpack.packb(None)` produce),
+         * (`0xc0`, what other LXMF implementations and python's `msgpack.packb(None)` produce),
          * we must emit Nil here too — emitting an empty Map (`0x80`) instead
          * would change the byte representation and break the message hash.
          * Mirrors python `msgpack.packb(unpacked_payload)` round-trip

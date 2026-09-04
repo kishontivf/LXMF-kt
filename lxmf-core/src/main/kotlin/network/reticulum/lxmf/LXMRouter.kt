@@ -26,6 +26,7 @@ import java.io.File
 import java.security.SecureRandom
 import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
+import network.reticulum.common.RnsLog
 
 /**
  * LXMF Message Router.
@@ -46,20 +47,137 @@ class LXMRouter(
     // ===== Configuration Constants =====
 
     companion object {
-        /** Maximum delivery attempts before failing */
-        const val MAX_DELIVERY_ATTEMPTS = 5
+        /**
+         * Attempts spent on one route before that route is treated as the problem.
+         *
+         * **This is a budget, not a death sentence**, and that is the whole difference between this
+         * router's retry model and Python's. Python fails the message here. We assume instead that
+         * a message which has failed this many times is being sent down a path that no longer
+         * exists — the common case on a mesh, where a peer moves between carriers and leaves a
+         * stale entry behind — so we throw the *path* away, ask for a fresh one, and hand the
+         * message its attempts back. The only thing that ever fails a message outright is
+         * [MAX_OUTBOUND_AGE].
+         *
+         * Higher than Python's five because these attempts are cheap now: they are spread by
+         * [RetryBackoff] instead of a flat ten seconds, so eight of them still fit inside the first
+         * few minutes.
+         */
+        const val MAX_DELIVERY_ATTEMPTS = 8
 
-        /** Processing loop interval in milliseconds */
-        const val PROCESSING_INTERVAL = 4000L
+        /**
+         * Processing loop interval in milliseconds.
+         *
+         * A quarter of Python's four seconds. The loop no longer decides *when* a message is due —
+         * each message carries its own next-attempt time — so this only sets how precisely those
+         * times are honoured. At four seconds a message due two seconds from now waited four, which
+         * on a two-hop exchange was most of the delay a person could feel.
+         */
+        const val PROCESSING_INTERVAL = 1000L
 
-        /** Wait time between delivery retries in milliseconds */
+        /**
+         * Wait time between delivery retries in milliseconds.
+         *
+         * Retained for callers that want a plain fixed wait; the outbound path itself schedules
+         * through [RetryBackoff] instead.
+         */
         const val DELIVERY_RETRY_WAIT = 10000L
 
-        /** Wait time for path discovery in milliseconds */
-        const val PATH_REQUEST_WAIT = 7000L
+        /**
+         * Wait time for path discovery in milliseconds.
+         *
+         * Equal to Reticulum's own `PATH_REQUEST_TIMEOUT`, which is what actually decides when an
+         * unanswered request is dead. Python waits seven seconds and so gives up on a path request
+         * that Reticulum is still waiting on: the retry fires while the answer is still in flight,
+         * which then costs another request.
+         */
+        const val PATH_REQUEST_WAIT = 15000L
 
-        /** Maximum pathless delivery attempts before requesting path */
+        /**
+         * Attempts made without a path before one is requested.
+         *
+         * **Left at Python's value on purpose.** The gate earns its place because of where this
+         * implementation gets the recipient's public key: from the `Destination`, which can be
+         * known without a path, so a send with no path is not certainly futile and a try spent on
+         * it can still succeed. A design that instead reads the key out of the path entry cannot
+         * succeed without one, and there the gate is pure latency — which is why a larger value
+         * gets proposed. Raising it to four here would mean four blind sends before we ask where
+         * the peer is: a regression in the only place the number is actually read.
+         */
         const val MAX_PATHLESS_TRIES = 1
+
+        /**
+         * How old an undelivered message may get before it is failed, in milliseconds.
+         *
+         * **The only terminal bound in the outbound path.** Everything else reschedules. A day is
+         * chosen against the case this router exists for: a peer that is simply not switched on.
+         * Failing a message because the recipient's phone was in a drawer over lunch is the wrong
+         * answer, and it is the answer an attempt-count bound gives.
+         */
+        const val MAX_OUTBOUND_AGE = 24L * 60 * 60 * 1000
+
+        /**
+         * How long after discarding a destination's path before it may be discarded again, in
+         * milliseconds.
+         *
+         * Without this, several queued messages to one absent peer each exhaust their attempts at
+         * about the same moment and each throw the path away and ask for a new one, which is a
+         * burst of path requests and the answering announces at exactly the moment the interface is
+         * least able to carry them.
+         */
+        const val PATH_INVALIDATION_COOLDOWN = 30000L
+
+        /**
+         * Attempts after which a path is suspected, before the full budget is spent.
+         *
+         * An early, cheap version of what happens at [MAX_DELIVERY_ATTEMPTS]: three failures in a
+         * row against a path that exists is already good evidence the path is stale, and asking for
+         * a fresh one now means the remaining attempts are spent on a route that might work rather
+         * than on the one already known not to.
+         */
+        const val PATH_DEMOTE_ATTEMPTS = 3
+
+        /**
+         * How long a message waits after its route was thrown away, in milliseconds.
+         *
+         * It is not really a wait — it is a parking spot. A message here is released the moment a
+         * path for its destination appears, which is what `wakeMessagesWithFreshPath` does. This is
+         * only the backstop for the case where no path ever arrives, and it is long because
+         * retrying sooner would just spend attempts on a destination Reticulum has said nothing
+         * about.
+         */
+        const val UNPROVEN_ROUTE_RETRY_WAIT = 300000L
+
+        /** LXMF timestamps are epoch *seconds* as a Double; the queue works in milliseconds. */
+        private const val MILLIS_PER_SECOND = 1000
+
+        /**
+         * How long a resource transfer may sit in [MessageState.SENDING] before it is sent again.
+         *
+         * Long enough not to interrupt a slow but working transfer — an image-sized payload can
+         * take tens of seconds over a constrained carrier — and short enough that a transfer whose
+         * link died is not simply lost.
+         */
+        private const val SENDING_STALL_TIMEOUT = 120000L
+
+        /**
+         * How long a link may sit unestablished before the message waiting on it gives up on it.
+         *
+         * Generous against Reticulum's own `ESTABLISHMENT_TIMEOUT_PER_HOP` of six seconds, because
+         * this is a backstop for the case where the watchdog did not fire at all rather than a
+         * second opinion about how long establishment should take.
+         */
+        private const val LINK_ESTABLISHMENT_TIMEOUT = 30000L
+
+        /** A route reaching the peer with no node in between. See [hasBetterRouteThanLink]. */
+        private const val DIRECT_ROUTE_HOPS = 1
+
+        /**
+         * The pause between a link reporting ACTIVE and the first packet down it.
+         *
+         * The far side arms its receive callback when its own link-established callback runs, and
+         * that is not synchronous with our proof validating.
+         */
+        private const val LINK_READY_GRACE = 100L
 
         /** Message expiry time in milliseconds (30 days) */
         const val MESSAGE_EXPIRY = 30L * 24 * 60 * 60 * 1000
@@ -112,6 +230,32 @@ class LXMRouter(
     private val failedOutbound = mutableListOf<LXMessage>()
     private val failedOutboundMutex = Mutex()
 
+    // ===== Route Retry State =====
+    //
+    // Held beside the queue rather than on [LXMessage], because none of it is part of a message:
+    // it is what this router has learned about *routes* while trying to deliver. A cooldown belongs
+    // to a destination, and the other two are per message but exist only while it is queued.
+    //
+    // All three are guarded by [retryStateLock]. Every critical section is a few map operations and
+    // nothing suspends inside one.
+
+    private val retryStateLock = Any()
+
+    /** When each destination's path was last thrown away, by destination hex hash. */
+    private val lastPathInvalidation = mutableMapOf<String, Long>()
+
+    /** How many times in a row a message has been rescheduled for want of a path, by message hex hash. */
+    private val pathlessBackoffSteps = mutableMapOf<String, Int>()
+
+    /**
+     * Messages parked because their route absorbed a whole attempt budget without proving itself,
+     * by message hex hash.
+     *
+     * Released early by [wakeMessagesWithFreshPath] the moment a path to the destination exists
+     * again, which is the difference between a park and a sentence.
+     */
+    private val awaitingFreshPath = mutableSetOf<String>()
+
     // ===== Destinations and Links =====
 
     /** Registered delivery destinations: hash -> Destination */
@@ -125,6 +269,7 @@ class LXMRouter(
 
     /** Destinations with pending link establishments: destination_hash -> started_at_ms */
     private val pendingLinkEstablishments = ConcurrentHashMap<String, Long>()
+
 
     /** Pending resource transfers: message_hash -> (message, resource) */
     private val pendingResources = ConcurrentHashMap<String, Pair<LXMessage, Resource>>()
@@ -497,7 +642,7 @@ class LXMRouter(
             val costEntry = outboundStampCosts[destHashHex]
             if (costEntry != null) {
                 message.stampCost = costEntry.second
-                println("[LXMRouter] Auto-configured stamp cost to ${costEntry.second} for $destHashHex")
+                RnsLog.debug("LXMRouter") { "Auto-configured stamp cost to ${costEntry.second} for $destHashHex" }
             }
         }
 
@@ -583,7 +728,26 @@ class LXMRouter(
             // caller on this same mutex. See LXMRouterTest
             // "handleOutbound not blocked when processOutboundMessage hangs".
             pendingOutboundMutex.withLock {
+                wakeMessagesWithFreshPath(pendingOutbound)
+
+                if (pendingOutbound.isNotEmpty()) {
+                    RnsLog.debug("LXMRouter") {
+                        "QUEUE census: " + pendingOutbound.joinToString { m ->
+                            "${m.destinationHash.toHexString().take(8)}" +
+                                " state=${m.state} method=${m.desiredMethod}" +
+                                " attempts=${m.deliveryAttempts}" +
+                                " dueIn=${(m.nextDeliveryAttempt ?: 0L) - currentTime}ms"
+                        }
+                    }
+                }
+
                 for (message in pendingOutbound) {
+                    if (message.hasOutlivedTheQueue(currentTime)) {
+                        RnsLog.warn("LXMRouter") { "Giving up on a message to ${message.destinationHash.toHexString()} after $MAX_OUTBOUND_AGE ms" }
+
+                        message.state = MessageState.FAILED
+                    }
+
                     when (message.state) {
                         MessageState.DELIVERED -> {
                             toRemove.add(message)
@@ -593,6 +757,38 @@ class LXMRouter(
                             // For propagated messages, SENT is final
                             if (message.method == DeliveryMethod.PROPAGATED) {
                                 toRemove.add(message)
+                            } else if (currentTime >= (message.nextDeliveryAttempt ?: 0L)) {
+                                // **Sent is not delivered.** An opportunistic message — and a
+                                // direct one small enough to travel as a packet — reaches SENT the
+                                // moment it is handed to the transport, and only a delivery proof
+                                // can move it past that. Without this branch nothing ever looks at
+                                // it again: it is not OUTBOUND so it is never dispatched, and it is
+                                // not terminal so it is never removed. The symptom is a queue of
+                                // messages stuck at SENT and overdue by minutes with the recipient
+                                // one hop away: the send went into a write that was lost, and
+                                // nothing retried it.
+                                //
+                                // So a message whose retry wait has passed with no proof goes back
+                                // to OUTBOUND and is sent again, earning a fresh delivery proof
+                                // each time, until a proof arrives or the route budget is spent.
+                                // Python keeps a DIRECT message in the queue until DELIVERED for
+                                // the same reason.
+                                //
+                                // Re-sending can deliver the same message twice; the receiving side
+                                // drops the duplicate on its transient id, which is what that cache
+                                // is for.
+                                message.state = MessageState.OUTBOUND
+
+                                // Spread on the same curve the pathless retries use, rather than a
+                                // flat wait. Flat, every unproven message re-sends every ten
+                                // seconds until its budget is gone — and a command fanned out to
+                                // every contact turns a handful of absent peers into several times
+                                // as many transmissions on whatever carrier is narrowest, with
+                                // ordinary messages timing out behind them.
+                                message.nextDeliveryAttempt = currentTime +
+                                    maxOf(DELIVERY_RETRY_WAIT, RetryBackoff.afterStep(message.deliveryAttempts))
+
+                                toDispatch.add(message)
                             }
                         }
 
@@ -618,8 +814,29 @@ class LXMRouter(
                             }
                         }
 
+                        MessageState.SENDING -> {
+                            // A resource transfer in flight, which is the right place to be — until
+                            // it is not. The transfer reports completion and failure through
+                            // callbacks, so a link that dies without either leaves the message
+                            // here with nothing to move it: not OUTBOUND, so never dispatched, and
+                            // not terminal, so never removed. The symptom is an entry sitting in
+                            // SENDING well past its due time with nothing ever looking at it.
+                            //
+                            // The bound is deliberately generous. A real transfer takes as long as
+                            // the carrier needs, and tens of kilobytes over a constrained one takes
+                            // tens of seconds — so this is a wedge-breaker, not an opinion about
+                            // how fast a resource ought to be.
+                            if (currentTime - (message.nextDeliveryAttempt ?: currentTime) > SENDING_STALL_TIMEOUT) {
+                                RnsLog.warn("LXMRouter") { "A resource to ${message.destinationHash.toHexString()} stalled; sending it again" }
+
+                                message.state = MessageState.OUTBOUND
+
+                                toDispatch.add(message)
+                            }
+                        }
+
                         else -> {
-                            // Other states (GENERATING, SENDING) - wait
+                            // Other states (GENERATING) - wait
                         }
                     }
                 }
@@ -707,6 +924,203 @@ class LXMRouter(
     }
 
     /**
+     * Throws away the known path to [destinationHash] and asks for a fresh one, unless the same
+     * destination was cleared too recently.
+     *
+     * The lighter alternative — marking the path unresponsive and keeping the entry — does not work
+     * on a mesh where a transport node is still cheerfully announcing the stale route: it simply
+     * re-asserts it, and every retry falls into the same hole while the peer sits one hop away on a
+     * carrier we are not using. Removing the entry outright makes the next announce win the path on
+     * merit, and the nearer carrier usually does.
+     *
+     * The cooldown is what stops that from becoming a loop of its own. Clearing a path provokes an
+     * announce that re-learns it; if the re-learned route is the same stale one we would clear it
+     * again a few attempts later, and several messages queued for one absent peer each do this at
+     * once. The gap gives a re-learned route a real chance to be tried before it is written off.
+     *
+     * @return true if the path was cleared, false if the cooldown suppressed it.
+     */
+    private fun invalidateUnprovenPath(destinationHash: ByteArray): Boolean {
+        val key = destinationHash.toHexString()
+        val now = System.currentTimeMillis()
+
+        synchronized(retryStateLock) {
+            val last = lastPathInvalidation[key]
+
+            if (last != null && now - last < PATH_INVALIDATION_COOLDOWN) return false
+
+            lastPathInvalidation[key] = now
+        }
+
+        Transport.expirePath(destinationHash)
+        Transport.requestPath(destinationHash)
+
+        RnsLog.info("LXMRouter") { "Cleared unproven path to $key and requested a fresh one" }
+
+        return true
+    }
+
+    /**
+     * Reschedules a message that could not be attempted because there is no path, spending no part
+     * of its delivery budget.
+     *
+     * [MAX_DELIVERY_ATTEMPTS] counts *transmissions* — sends that were made and went unproven.
+     * Charging it for "this device had no route" is what made the age bound unreachable in exactly
+     * the case it exists for: a message with no path exhausted the budget in a couple of minutes
+     * and was discarded while the radio it was waiting for was still coming back up.
+     *
+     * No attempt is refunded here, because there is nothing to refund: each branch bills its own
+     * attempt and the pathless branches simply do not. The alternative shape — incrementing once
+     * at the top of the loop and having every branch undo it — is what needs a refund; this one
+     * does not.
+     */
+    private fun rescheduleWithoutPath(message: LXMessage) {
+        val step = message.hash?.let { hash ->
+            val key = hash.toHexString()
+
+            synchronized(retryStateLock) {
+                val current = pathlessBackoffSteps[key] ?: 0
+                pathlessBackoffSteps[key] = current + 1
+
+                current
+            }
+        } ?: 0
+
+        message.nextDeliveryAttempt = System.currentTimeMillis() + RetryBackoff.afterStep(step)
+    }
+
+    /**
+     * Handles a message whose route has absorbed [MAX_DELIVERY_ATTEMPTS] sends without a single
+     * delivery proof.
+     *
+     * **This is not a failure.** Eight unproven sends says the route is not delivering, not that
+     * the message is undeliverable, and the two are routinely confused by a stale multi-hop entry
+     * pointing away from a peer that is one hop away on another carrier. So the path goes, the
+     * budget resets for whatever route replaces it, and the message waits.
+     *
+     * The wait is a ceiling rather than a sentence: [wakeMessagesWithFreshPath] releases it as soon
+     * as a path exists again. Only [MAX_OUTBOUND_AGE] ever gives up.
+     */
+    private fun parkOnExhaustedRoute(message: LXMessage) {
+        invalidateUnprovenPath(message.destinationHash)
+
+        message.deliveryAttempts = 0
+        message.state = MessageState.OUTBOUND
+        message.nextDeliveryAttempt = System.currentTimeMillis() + UNPROVEN_ROUTE_RETRY_WAIT
+
+        message.hash?.toHexString()?.let { key ->
+            synchronized(retryStateLock) {
+                // The replacement route deserves a clean slate rather than inheriting the dead
+                // one's climb.
+                pathlessBackoffSteps[key] = 0
+                awaitingFreshPath.add(key)
+            }
+        }
+
+        RnsLog.warn("LXMRouter") {
+            "Route to ${message.destinationHash.toHexString()} took $MAX_DELIVERY_ATTEMPTS unproven sends; cleared it and parked the message"
+        }
+    }
+
+    /**
+     * Releases every parked or backed-off message whose destination is reachable again, and forgets
+     * the retry state of messages that have left the queue.
+     *
+     * Without this a message that ran out of route sits out the full [UNPROVEN_ROUTE_RETRY_WAIT]
+     * even though the peer walked back into range ten seconds later — a timer already overtaken by
+     * events. The backed-off ones matter just as much: a message five steps up the curve is waiting
+     * over a minute for a link that is now up.
+     *
+     * @param queue the outbound queue, which the caller must already hold the lock on.
+     */
+    private fun wakeMessagesWithFreshPath(queue: List<LXMessage>) {
+        val live = queue.mapNotNull { it.hash?.toHexString() }.toSet()
+
+        synchronized(retryStateLock) {
+            awaitingFreshPath.retainAll(live)
+            pathlessBackoffSteps.keys.retainAll(live)
+        }
+
+        val waiting = queue.filter { isWaitingOnAPath(it) }
+
+        if (waiting.isEmpty()) return
+
+        // One path lookup per destination rather than per message: several messages to the same
+        // absent peer is the ordinary case, not the exotic one.
+        val reachable = waiting
+            .distinctBy { it.destinationHash.toHexString() }
+            .filter { Transport.hasPath(it.destinationHash) }
+            .map { it.destinationHash.toHexString() }
+            .toSet()
+
+        val now = System.currentTimeMillis()
+
+        waiting.filter { it.destinationHash.toHexString() in reachable }.forEach { message ->
+            message.nextDeliveryAttempt = now
+
+            message.hash?.toHexString()?.let { key ->
+                synchronized(retryStateLock) {
+                    awaitingFreshPath.remove(key)
+                    // The outage is over, so a later failure starts the curve again rather than
+                    // resuming a climb that belonged to it.
+                    pathlessBackoffSteps[key] = 0
+                }
+            }
+
+            RnsLog.debug("LXMRouter") {
+                "Path to ${message.destinationHash.toHexString()} is back; releasing a waiting message early"
+            }
+        }
+    }
+
+    /**
+     * Whether this message has been queued longer than [MAX_OUTBOUND_AGE] and should be given up on.
+     *
+     * The single terminal bound in the outbound path, now that spending a delivery budget only
+     * costs the message its route. A message with no timestamp is never expired by age: it has no
+     * age to judge, and guessing one would fail messages for a missing field.
+     */
+    private fun LXMessage.hasOutlivedTheQueue(now: Long): Boolean {
+        if (state == MessageState.DELIVERED || state == MessageState.FAILED) return false
+
+        val createdAt = timestamp ?: return false
+
+        return now - (createdAt * MILLIS_PER_SECOND).toLong() > MAX_OUTBOUND_AGE
+    }
+
+    /**
+     * Puts a message that failed *this attempt* back on the queue instead of ending it.
+     *
+     * A receipt that times out and a resource transfer that gives up both mean the same thing: this
+     * try did not prove out. Neither means the message cannot be delivered — the receipt budget is
+     * derived from the hop count and a slow Bluetooth link beats it routinely, and a resource dies
+     * whenever the link under it does. Ending the message there contradicts the whole retry model,
+     * which says [MAX_OUTBOUND_AGE] is the only terminal bound: a long message goes `SENDING` →
+     * `FAILED` the moment its resource concludes empty, and nothing tries again.
+     *
+     * The failed callback still fires, because callers want to know an attempt went unproven; what
+     * changes is that the message stays in the queue and is sent again.
+     */
+    private fun retryAfterUnproven(message: LXMessage, reason: String) {
+        RnsLog.debug("LXMRouter") { "$reason for ${message.destinationHash.toHexString()}; will try again" }
+
+        message.state = MessageState.OUTBOUND
+        message.nextDeliveryAttempt = System.currentTimeMillis() +
+            maxOf(DELIVERY_RETRY_WAIT, RetryBackoff.afterStep(message.deliveryAttempts))
+
+        message.failedCallback?.invoke(message)
+    }
+
+    /** Whether [message] is being held back by the absence of a route rather than by its own schedule. */
+    private fun isWaitingOnAPath(message: LXMessage): Boolean {
+        val key = message.hash?.toHexString() ?: return false
+
+        return synchronized(retryStateLock) {
+            key in awaitingFreshPath || (pathlessBackoffSteps[key] ?: 0) > 0
+        }
+    }
+
+    /**
      * Process opportunistic message delivery.
      *
      * Matches Python LXMF LXMRouter opportunistic outbound handling (lines 2554-2581):
@@ -715,11 +1129,11 @@ class LXMRouter(
      * - Normal delivery attempt otherwise
      */
     private suspend fun processOpportunisticDelivery(message: LXMessage) {
-        // Check max delivery attempts FIRST (matching Python's <= check)
-        if (message.deliveryAttempts > MAX_DELIVERY_ATTEMPTS) {
-            // Max attempts reached - fail the message
-            message.state = MessageState.FAILED
-            message.failedCallback?.invoke(message)
+        // The route's budget, not the message's life. Spending it clears the path and parks the
+        // message rather than failing it — see [parkOnExhaustedRoute].
+        if (message.deliveryAttempts >= MAX_DELIVERY_ATTEMPTS) {
+            parkOnExhaustedRoute(message)
+
             return
         }
 
@@ -730,32 +1144,30 @@ class LXMRouter(
             return
         }
 
+        // Failover assist, well before the budget runs out: three unproven sends against a path
+        // that exists is already good evidence the path is the problem, and the attempts left are
+        // better spent on a route that might work than on the one already known not to. The
+        // cooldown inside [invalidateUnprovenPath] keeps this from becoming a loop.
+        if (message.deliveryAttempts == PATH_DEMOTE_ATTEMPTS && Transport.hasPath(dest.hash)) {
+            invalidateUnprovenPath(dest.hash)
+        }
+
         val hasPath = Transport.hasPath(dest.hash)
 
         when {
             // After MAX_PATHLESS_TRIES attempts without path, request path
             // Python: if delivery_attempts >= MAX_PATHLESS_TRIES and not has_path()
             message.deliveryAttempts >= MAX_PATHLESS_TRIES && !hasPath -> {
-                println("[LXMRouter] Requesting path after ${message.deliveryAttempts} pathless tries for ${message.destinationHash.toHexString()}")
-                message.deliveryAttempts++
-                Transport.requestPath(dest.hash)
-                message.nextDeliveryAttempt = System.currentTimeMillis() + PATH_REQUEST_WAIT
-                message.progress = 0.01
-            }
+                RnsLog.debug("LXMRouter") { "Requesting path after ${message.deliveryAttempts} pathless tries for ${message.destinationHash.toHexString()}" }
 
-            // At MAX_PATHLESS_TRIES+1 with path but still failing, rediscover path
-            // Python: elif delivery_attempts == MAX_PATHLESS_TRIES+1 and has_path()
-            message.deliveryAttempts == MAX_PATHLESS_TRIES + 1 && hasPath -> {
-                println("[LXMRouter] Opportunistic delivery still unsuccessful after ${message.deliveryAttempts} attempts, trying to rediscover path")
-                message.deliveryAttempts++
-                // Drop existing path and re-request (Python does this via Reticulum.drop_path + request_path)
-                Transport.expirePath(dest.hash)
-                // Small delay then request new path (matching Python's 0.5s sleep in thread)
-                processingScope.launch {
-                    delay(500)
-                    Transport.requestPath(dest.hash)
-                }
-                message.nextDeliveryAttempt = System.currentTimeMillis() + PATH_REQUEST_WAIT
+                Transport.requestPath(dest.hash)
+
+                // Nothing was transmitted, so nothing is billed and the wait comes off the backoff
+                // curve rather than being a flat PATH_REQUEST_WAIT. A coverage blip of a couple of
+                // seconds is then recovered in a couple of seconds, and a peer that has been dark
+                // for an hour costs almost nothing.
+                rescheduleWithoutPath(message)
+
                 message.progress = 0.01
             }
 
@@ -767,7 +1179,7 @@ class LXMRouter(
                 if (nextAttempt == 0L || now > nextAttempt) {
                     message.deliveryAttempts++
                     message.nextDeliveryAttempt = now + DELIVERY_RETRY_WAIT
-                    println("[LXMRouter] Opportunistic delivery attempt ${message.deliveryAttempts} for ${message.destinationHash.toHexString()}")
+                    RnsLog.debug("LXMRouter") { "Opportunistic delivery attempt ${message.deliveryAttempts} for ${message.destinationHash.toHexString()}" }
 
                     val sent = sendOpportunisticMessage(message)
                     if (sent) {
@@ -793,7 +1205,7 @@ class LXMRouter(
         // Get the destination - required for encryption
         val dest = message.destination
         if (dest == null) {
-            println("[LXMRouter] Cannot send opportunistic: no destination")
+            RnsLog.error("LXMRouter") { "Cannot send opportunistic: no destination" }
             return false
         }
 
@@ -805,12 +1217,12 @@ class LXMRouter(
 
         // Debug logging
         val destPubKey = dest.identity?.getPublicKey()
-        println("[LXMRouter] sendOpportunisticMessage:")
-        println("[LXMRouter]   Destination hash: ${message.destinationHash.toHexString()}")
-        println("[LXMRouter]   Dest identity hash: ${dest.identity?.hash?.toHexString() ?: "null"}")
-        println("[LXMRouter]   Dest public key (first 8 bytes): ${destPubKey?.take(8)?.toByteArray()?.toHexString() ?: "null"}")
-        println("[LXMRouter]   Plain data size: ${plainData.size} bytes")
-        println("[LXMRouter]   Plain data (first 32 bytes): ${plainData.take(32).toByteArray().toHexString()}")
+        RnsLog.debug("LXMRouter") { "sendOpportunisticMessage:" }
+        RnsLog.debug("LXMRouter") { "Destination hash: ${message.destinationHash.toHexString()}" }
+        RnsLog.debug("LXMRouter") { "Dest identity hash: ${dest.identity?.hash?.toHexString() ?: "null"}" }
+        RnsLog.debug("LXMRouter") { "Dest public key (first 8 bytes): ${destPubKey?.take(8)?.toByteArray()?.toHexString() ?: "null"}" }
+        RnsLog.debug("LXMRouter") { "Plain data size: ${plainData.size} bytes" }
+        RnsLog.debug("LXMRouter") { "Plain data (first 32 bytes): ${plainData.take(32).toByteArray().toHexString()}" }
 
         // Create the packet - Packet.create() will encrypt the data for us
         val packet =
@@ -822,12 +1234,24 @@ class LXMRouter(
                 transportType = TransportType.BROADCAST,
             )
 
-        println("[LXMRouter]   Packed packet size: ${packet.raw?.size ?: packet.pack().size} bytes")
+        RnsLog.debug("LXMRouter") { "Packed packet size: ${packet.raw?.size ?: packet.pack().size} bytes" }
 
         // Send via packet.send() to get receipt for delivery confirmation
         val receipt = packet.send()
         if (receipt != null) {
-            println("[LXMRouter] Sent opportunistic message to ${message.destinationHash.toHexString()}")
+            RnsLog.debug("LXMRouter") { "Sent opportunistic message to ${message.destinationHash.toHexString()}" }
+
+            // Dual-dispatch, and this is the moment for it. The route this packet has just gone
+            // out by may be a multi-hop path that cannot actually deliver — a peer standing
+            // next to this device reached through somebody else's relay — while the direct carrier
+            // link to it sits idle. Sending the same packet over a carrier the peer was recently
+            // heard on gets it there without waiting for several unproven attempts to prove the
+            // route dead. The receiver drops whichever copy arrives second on its packet hash, so
+            // this is free wherever it was not needed. Best effort: a failure here changes nothing
+            // about the send that already succeeded.
+            packet.raw?.let { raw ->
+                runCatching { Transport.sendFallbackCopy(message.destinationHash, raw) }
+            }
 
             // Set up delivery confirmation callback
             receipt.setDeliveryCallback { _ ->
@@ -837,13 +1261,12 @@ class LXMRouter(
 
             // Set up timeout callback
             receipt.setTimeoutCallback { _ ->
-                message.state = MessageState.FAILED
-                message.failedCallback?.invoke(message)
+                retryAfterUnproven(message, "An opportunistic send went unproven")
             }
 
             return true
         } else {
-            println("[LXMRouter] Failed to send opportunistic message")
+            RnsLog.error("LXMRouter") { "Failed to send opportunistic message" }
             return false
         }
     }
@@ -867,12 +1290,18 @@ class LXMRouter(
      * "DIRECT failed → fall back to PROPAGATED" hook in upstream callers.
      */
     private suspend fun processDirectDelivery(message: LXMessage) {
-        // Check max delivery attempts FIRST. Always invoke failedCallback so
-        // upstream consumers (e.g. propagation fallback) get notified.
-        if (message.deliveryAttempts > MAX_DELIVERY_ATTEMPTS) {
-            message.state = MessageState.FAILED
-            message.failedCallback?.invoke(message)
+        // The route's budget, not the message's life — as in [processOpportunisticDelivery].
+        if (message.deliveryAttempts >= MAX_DELIVERY_ATTEMPTS) {
+            parkOnExhaustedRoute(message)
+
             return
+        }
+
+        // Failover assist, as in [processOpportunisticDelivery]: three unproven sends against a
+        // path that exists is evidence the path is the problem, and clearing it lets the next
+        // announce win the route on merit rather than re-asserting the one already failing.
+        if (message.deliveryAttempts == PATH_DEMOTE_ATTEMPTS && Transport.hasPath(message.destinationHash)) {
+            invalidateUnprovenPath(message.destinationHash)
         }
 
         val destHashHex = message.destinationHash.toHexString()
@@ -890,6 +1319,27 @@ class LXMRouter(
             }
         }
 
+        // A held link does not follow the routing table, so a better carrier appearing after it
+        // was opened changes nothing for it — see [hasBetterRouteThanLink].
+        if (link != null && link.status == LinkConstants.ACTIVE && hasBetterRouteThanLink(link, message.destinationHash)) {
+            RnsLog.debug("LXMRouter") { "A better route to $destHashHex exists; replacing its link" }
+
+            // **Stop using it; do not tear it down.** A link carries the delivery proofs for
+            // whatever has already gone out on it, and closing it throws those away: the peer has
+            // the message and answers it, while the sender sits on a row that still says it never
+            // arrived. Observed immediately on doing exactly that — the far phone showed the
+            // message received *and* its own reply delivered, and this one still showed the
+            // original as unsent.
+            //
+            // Forgetting it here is enough for the purpose: the next message establishes a fresh
+            // link over the better interface, and this one closes on its own timeout once its
+            // outstanding proofs have had their chance.
+            directLinks.remove(destHashHex)
+            pendingLinkEstablishments.remove(destHashHex)
+
+            link = null
+        }
+
         when {
             link != null && link.status == LinkConstants.ACTIVE -> {
                 // Use existing active link (direct or backchannel)
@@ -897,10 +1347,22 @@ class LXMRouter(
             }
 
             link != null && link.status == LinkConstants.PENDING -> {
-                // Wait for the link to activate or close. The Link watchdog will
-                // fire teardown on its own establishment timeout; closedCallback
-                // then removes the entry so the next tick creates a fresh
-                // attempt. (Python LXMRouter.py:2630-2632.)
+                // Rare, and only a floor. A message that asked for a link is normally released by
+                // [wakeMessagesWithActiveLink] the instant it establishes, so it is not still
+                // sitting here waiting for a tick to notice. What remains is the case that floor
+                // was built for: a link that never establishes at all, whose message would
+                // otherwise be examined every tick forever, PENDING being neither dispatched nor
+                // terminal — so without this floor such an entry stays overdue indefinitely.
+                val startedAt = pendingLinkEstablishments[destHashHex]
+
+                if (startedAt != null && System.currentTimeMillis() - startedAt > LINK_ESTABLISHMENT_TIMEOUT) {
+                    RnsLog.warn("LXMRouter") { "Link to $destHashHex never activated; abandoning it and retrying" }
+
+                    directLinks.remove(destHashHex)
+                    pendingLinkEstablishments.remove(destHashHex)
+
+                    rescheduleWithoutPath(message)
+                }
             }
 
             link != null && link.status == LinkConstants.CLOSED -> {
@@ -926,30 +1388,96 @@ class LXMRouter(
                 val now = System.currentTimeMillis()
                 val nextAttempt = message.nextDeliveryAttempt ?: 0L
                 if (nextAttempt == 0L || now >= nextAttempt) {
-                    message.deliveryAttempts++
-                    message.nextDeliveryAttempt = now + DELIVERY_RETRY_WAIT
+                    if (Transport.hasPath(message.destinationHash)) {
+                        // Path known — establish the link. (:2642-2647)
+                        message.deliveryAttempts++
+                        message.nextDeliveryAttempt = now + DELIVERY_RETRY_WAIT
 
-                    // Strictly `<` MAX (Python :2641): on the attempt that reaches
-                    // MAX we neither establish nor request — the next tick's
-                    // top-of-function check (deliveryAttempts > MAX) fails the
-                    // message and invokes failedCallback, matching Python's
-                    // `<= MAX` gate at :2579 + fail_message at :2655.
-                    if (message.deliveryAttempts < MAX_DELIVERY_ATTEMPTS) {
-                        if (Transport.hasPath(message.destinationHash)) {
-                            // Path known — establish the link. (:2642-2647)
-                            establishLinkForMessage(message)
-                            message.progress = 0.03
-                        } else {
-                            // No path — request one and wait PATH_REQUEST_WAIT before
-                            // the next attempt. This is the core columba#1004 fix:
-                            // DIRECT delivery now requests a path instead of blindly
-                            // attempting a link against a missing/stale path. (:2648-2652)
-                            Transport.requestPath(message.destinationHash)
-                            message.nextDeliveryAttempt = now + PATH_REQUEST_WAIT
-                            message.progress = 0.01
-                        }
+                        establishLinkForMessage(message)
+
+                        message.progress = 0.03
+                    } else {
+                        // No path — request one. This is the core columba#1004 fix: DIRECT
+                        // delivery requests a path instead of blindly attempting a link against a
+                        // missing or stale one. (:2648-2652)
+                        //
+                        // The attempt is no longer billed here, and the increment has moved into
+                        // the branch above to make that so: no link was attempted, so this is not
+                        // one of the transmissions the budget counts.
+                        Transport.requestPath(message.destinationHash)
+
+                        rescheduleWithoutPath(message)
+
+                        message.progress = 0.01
                     }
                 }
+            }
+        }
+    }
+
+    /**
+     * Whether the routing table now offers something better than the interface this link is stuck on.
+     *
+     * **A link is bound to one interface for life.** `attachedInterfaceHash` is fixed when it
+     * activates, and every send on it goes out that way, bypassing the path table — which is right
+     * for a link and wrong for a router that has been holding one since before a better carrier
+     * existed. And the ordering makes that the *normal* case for a carrier that has to negotiate
+     * itself into being: the negotiation needs a route, the only route is a relay, and establishing
+     * it opens the very link that then refuses to move once the direct carrier is up.
+     *
+     * So a link established over a relay a fraction of a second before the direct route appears
+     * goes on sending through that relay indefinitely, while every routed packet in both directions
+     * has long since switched to the direct carrier. Only large messages take a link, so it
+     * surfaces as short and medium messages going direct while long ones always take the relay.
+     *
+     * Deliberately narrow. It says yes only when the best route is **direct** — one hop — and runs
+     * over a different interface than the link. A direct route is unambiguously better than a link
+     * through a relay, and requiring it keeps an oscillating multi-hop path from tearing links down
+     * repeatedly, which would cost more than the worse route does.
+     */
+    private fun hasBetterRouteThanLink(link: Link, destinationHash: ByteArray): Boolean {
+        val linkInterface = link.attachedInterfaceHash ?: return false
+        val pathInterface = Transport.pathInterfaceHash(destinationHash) ?: return false
+
+        if (linkInterface.contentEquals(pathInterface)) return false
+
+        return Transport.hopsTo(destinationHash) == DIRECT_ROUTE_HOPS
+    }
+
+    /**
+     * Releases the messages that were waiting for this link, the moment it establishes.
+     *
+     * **Because the backoff outlives what it was waiting for.** A message that needs a link is
+     * tried once, finds none, asks for one, and is rescheduled on the retry curve. The link then
+     * comes up in a fraction of a second — and nothing tells the message. The link can be
+     * established and carrying resources in both directions while the one message that asked for
+     * it still sits on a multi-second backoff, and the exchange it belonged to finishes without
+     * it. Smaller messages in the same exchange travel opportunistically and arrive, so the loss
+     * is silent and looks like one message going missing rather than a scheduling fault.
+     *
+     * A router that blocks inside the send, polling the link until it is usable, needs nothing
+     * like this. Ours does not work that way: it queues and runs on a tick, so reaching the same
+     * place means being *told* rather than asking, and [Link.create]'s established callback is
+     * where that happens.
+     *
+     * The messages are made due rather than sent from here, so a send still happens on the
+     * processing loop with every check it makes, one tick later at the outside.
+     */
+    private fun wakeMessagesWithActiveLink(destHashHex: String) {
+        processingScope.launch {
+            val now = System.currentTimeMillis()
+
+            val released = pendingOutboundMutex.withLock {
+                pendingOutbound
+                    .filter { it.destinationHash.toHexString() == destHashHex }
+                    .onEach { it.nextDeliveryAttempt = now }
+                    .size
+            }
+
+            if (released == 0) return@launch
+
+            RnsLog.debug("LXMRouter") {
+                "Link to $destHashHex is up; releasing $released waiting message(s) early"
             }
         }
     }
@@ -988,6 +1516,8 @@ class LXMRouter(
 
                         // Set up link callbacks for receiving
                         setupLinkCallbacks(establishedLink, destHashHex)
+
+                        wakeMessagesWithActiveLink(destHashHex)
 
                         // Identify ourselves on the link
                         identifyOnLink(establishedLink)
@@ -1048,7 +1578,7 @@ class LXMRouter(
             directLinks[destHashHex] = link
         } catch (e: Exception) {
             pendingLinkEstablishments.remove(destHashHex)
-            println("Failed to establish link to $destHashHex: ${e.message}")
+            RnsLog.error("LXMRouter") { "Failed to establish link to $destHashHex: ${e.message}" }
             message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
         }
     }
@@ -1077,7 +1607,7 @@ class LXMRouter(
         }
 
         link.setResourceStartedCallback { _: Any ->
-            println("Resource transfer started on link to $destHashHex")
+            RnsLog.debug("LXMRouter") { "Resource transfer started on link to $destHashHex" }
         }
 
         link.setResourceConcludedCallback { resource: Any ->
@@ -1092,15 +1622,15 @@ class LXMRouter(
         // Get our first delivery destination's identity
         val deliveryDest = deliveryDestinations.values.firstOrNull()
         if (deliveryDest == null) {
-            println("[LXMRouter] identifyOnLink: NO delivery destinations registered!")
+            RnsLog.debug("LXMRouter") { "identifyOnLink: NO delivery destinations registered!" }
             return
         }
 
         try {
-            println("[LXMRouter] identifyOnLink: identifying as ${deliveryDest.identity.hexHash.take(12)}")
+            RnsLog.debug("LXMRouter") { "identifyOnLink: identifying as ${deliveryDest.identity.hexHash.take(12)}" }
             link.identify(deliveryDest.identity)
         } catch (e: Exception) {
-            println("[LXMRouter] identifyOnLink FAILED: ${e.message}")
+            RnsLog.error("LXMRouter") { "identifyOnLink FAILED: ${e.message}" }
         }
     }
 
@@ -1133,13 +1663,13 @@ class LXMRouter(
         // Cast to Resource and extract data
         val res = resource as? Resource
         if (res == null) {
-            println("Resource concluded but could not cast resource")
+            RnsLog.debug("LXMRouter") { "Resource concluded but could not cast resource" }
             return
         }
 
         val data = res.data
         if (data == null || data.isEmpty()) {
-            println("Resource concluded but no data received")
+            RnsLog.debug("LXMRouter") { "Resource concluded but no data received" }
             return
         }
 
@@ -1260,7 +1790,7 @@ class LXMRouter(
                 )
             }
             val propStamp = propStampResult.stamp
-            println("[LXMRouter] Propagation stamp generated: value=${propStampResult.value}, cost=${getActivePropagationNode()?.stampCost}")
+            RnsLog.debug("LXMRouter") { "Propagation stamp generated: value=${propStampResult.value}, cost=${getActivePropagationNode()?.stampCost}" }
 
             // Append propagation stamp (Python strips last STAMP_SIZE bytes before computing transient_id)
             val transientData = if (propStamp != null) lxmData + propStamp else lxmData
@@ -1300,12 +1830,12 @@ class LXMRouter(
             val messageHashHex = message.hash?.toHexString() ?: ""
             resource.callbacks.failed = {
                 pendingResources.remove(messageHashHex)
-                message.state = MessageState.FAILED
-                message.failedCallback?.invoke(message)
+
+                retryAfterUnproven(message, "A resource to a propagation node failed")
             }
             pendingResources[messageHashHex] = Pair(message, resource)
         } catch (e: Exception) {
-            println("Failed to send via propagation: ${e.message}")
+            RnsLog.error("LXMRouter") { "Failed to send via propagation: ${e.message}" }
             message.state = MessageState.OUTBOUND
             message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
         }
@@ -1343,8 +1873,7 @@ class LXMRouter(
 
                     // Set up timeout callback
                     receipt.setTimeoutCallback { _ ->
-                        message.state = MessageState.FAILED
-                        message.failedCallback?.invoke(message)
+                        retryAfterUnproven(message, "A packet over a link went unproven")
                     }
                 } else {
                     // Send failed
@@ -1352,7 +1881,7 @@ class LXMRouter(
                     message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
                 }
             } catch (e: Exception) {
-                println("Failed to send packet via link: ${e.message}")
+                RnsLog.error("LXMRouter") { "Failed to send packet via link: ${e.message}" }
                 message.state = MessageState.OUTBOUND
                 message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
             }
@@ -1379,15 +1908,15 @@ class LXMRouter(
                     )
                 resource.callbacks.failed = {
                     pendingResources.remove(messageHashHex)
-                    message.state = MessageState.FAILED
-                    message.failedCallback?.invoke(message)
+
+                    retryAfterUnproven(message, "A resource transfer failed")
                 }
 
                 // Track resource for completion
                 pendingResources[messageHashHex] = Pair(message, resource)
                 message.state = MessageState.SENDING
             } catch (e: Exception) {
-                println("Failed to send resource via link: ${e.message}")
+                RnsLog.error("LXMRouter") { "Failed to send resource via link: ${e.message}" }
                 message.state = MessageState.OUTBOUND
                 message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
             }
@@ -1408,13 +1937,13 @@ class LXMRouter(
         // This is what triggers delivery confirmation on the sender side
         packet?.prove()
 
-        println("[LXMRouter] handleDeliveryPacket called with ${data.size} bytes for ${destination.hexHash}")
+        RnsLog.debug("LXMRouter") { "handleDeliveryPacket called with ${data.size} bytes for ${destination.hexHash}" }
         // For OPPORTUNISTIC delivery (single packet), the data doesn't include the
         // destination hash - we need to prepend it to match the LXMF message format.
         // Format: [destination_hash (16)] + [source_hash (16)] + [signature (64)] + [payload]
         val method = DeliveryMethod.OPPORTUNISTIC
         val lxmfData = destination.hash + data
-        println("[LXMRouter] Prepended dest hash, lxmfData size: ${lxmfData.size} bytes (was ${data.size})")
+        RnsLog.debug("LXMRouter") { "Prepended dest hash, lxmfData size: ${lxmfData.size} bytes (was ${data.size})" }
 
         // Process the delivery. `packet` carries the receive-time phy metadata
         // (rssi/snr/interface/hops) we want to surface on the LXMessage.
@@ -1452,7 +1981,7 @@ class LXMRouter(
         // to reveal their identity so we can reply to them
         link.setRemoteIdentifiedCallback { _, remoteIdentity ->
             val remoteHashHex = remoteIdentity.hexHash
-            println("[LXMRouter] Remote peer identified on link: $remoteHashHex")
+            RnsLog.debug("LXMRouter") { "Remote peer identified on link: $remoteHashHex" }
 
             // Calculate the LXMF delivery destination hash from the identity
             // This is the hash that will appear as sourceHash in LXMF messages
@@ -1471,7 +2000,7 @@ class LXMRouter(
                 publicKey = remoteIdentity.getPublicKey(),
                 appData = null,
             )
-            println("[LXMRouter] Stored identity for LXMF dest: $lxmfDestHashHex")
+            RnsLog.debug("LXMRouter") { "Stored identity for LXMF dest: $lxmfDestHashHex" }
         }
 
         // Also check if identity is already known (for immediate identification)
@@ -1501,12 +2030,12 @@ class LXMRouter(
         link: Link? = null,
         sourcePacket: Packet? = null,
     ) {
-        println("[LXMRouter] processInboundDelivery called with ${data.size} bytes, method=$method")
+        RnsLog.debug("LXMRouter") { "processInboundDelivery called with ${data.size} bytes, method=$method" }
 
         // Enforce incoming message size limit
         val limitKb = incomingMessageSizeLimitKb
         if (limitKb != null && data.size > limitKb * 1024) {
-            println("[LXMRouter] Rejecting oversized message: ${data.size} bytes > ${limitKb}KB limit")
+            RnsLog.debug("LXMRouter") { "Rejecting oversized message: ${data.size} bytes > ${limitKb}KB limit" }
             return
         }
 
@@ -1521,18 +2050,18 @@ class LXMRouter(
                 val deliveryDest = deliveryDestinations[destHashHex]
                 if (deliveryDest != null) {
                     val encryptedData = data.copyOfRange(LXMFConstants.DESTINATION_LENGTH, data.size)
-                    println("[LXMRouter] Decrypting propagated message: encrypted=${encryptedData.size} bytes, identity.hasPrivateKey=${deliveryDest.destination.identity?.hasPrivateKey}")
+                    RnsLog.debug("LXMRouter") { "Decrypting propagated message: encrypted=${encryptedData.size} bytes, identity.hasPrivateKey=${deliveryDest.destination.identity?.hasPrivateKey}" }
                     val decryptedData = deliveryDest.destination.decrypt(encryptedData)
                     if (decryptedData != null) {
-                        println("[LXMRouter] Decrypted propagated message for $destHashHex")
+                        RnsLog.debug("LXMRouter") { "Decrypted propagated message for $destHashHex" }
                         destHash + decryptedData
                     } else {
-                        println("[LXMRouter] Failed to decrypt propagated message for $destHashHex")
+                        RnsLog.error("LXMRouter") { "Failed to decrypt propagated message for $destHashHex" }
                         return
                     }
                 } else {
                     // Not addressed to us — shouldn't happen in normal flow
-                    println("[LXMRouter] Propagated message not for us: $destHashHex")
+                    RnsLog.debug("LXMRouter") { "Propagated message not for us: $destHashHex" }
                     return
                 }
             } else {
@@ -1542,10 +2071,10 @@ class LXMRouter(
             // Unpack the message
             val message = LXMessage.unpackFromBytes(lxmfData, method)
             if (message == null) {
-                println("[LXMRouter] Failed to unpack LXMF message")
+                RnsLog.error("LXMRouter") { "Failed to unpack LXMF message" }
                 return
             }
-            println("[LXMRouter] Unpacked message from ${message.sourceHash.toHexString()}")
+            RnsLog.debug("LXMRouter") { "Unpacked message from ${message.sourceHash.toHexString()}" }
 
             message.incoming = true
             message.method = method
@@ -1565,7 +2094,7 @@ class LXMRouter(
             // message.hash as the locally_delivered_transient_ids key.
             val dedupKey = message.hash?.toHexString()
             if (dedupKey != null && locallyDeliveredTransientIds.containsKey(dedupKey)) {
-                println("Duplicate message detected, ignoring")
+                RnsLog.debug("LXMRouter") { "Duplicate message detected, ignoring" }
                 return
             }
 
@@ -1574,10 +2103,10 @@ class LXMRouter(
                 when (message.unverifiedReason) {
                     UnverifiedReason.SOURCE_UNKNOWN -> {
                         // Source not known - could still accept depending on policy
-                        println("Message from unknown source: ${message.sourceHash.toHexString()}")
+                        RnsLog.debug("LXMRouter") { "Message from unknown source: ${message.sourceHash.toHexString()}" }
                     }
                     UnverifiedReason.SIGNATURE_INVALID -> {
-                        println("Message signature invalid, rejecting")
+                        RnsLog.warn("LXMRouter") { "Message signature invalid, rejecting" }
                         return
                     }
                     null -> {
@@ -1589,7 +2118,7 @@ class LXMRouter(
             // Check ignored list (access control)
             val sourceHashHexForCheck = message.sourceHash.toHexString()
             if (ignoredList.any { it.toHexString() == sourceHashHexForCheck }) {
-                println("[LXMRouter] Ignored message from $sourceHashHexForCheck")
+                RnsLog.debug("LXMRouter") { "Ignored message from $sourceHashHexForCheck" }
                 return
             }
 
@@ -1605,9 +2134,9 @@ class LXMRouter(
                 val tickets = getInboundTickets(sourceHashHexForCheck)
                 if (!message.validateStamp(requiredCost, tickets)) {
                     if (noStampEnforcement) {
-                        println("[LXMRouter] Message from $sourceHashHexForCheck has invalid stamp, but allowing (PAPER delivery)")
+                        RnsLog.warn("LXMRouter") { "Message from $sourceHashHexForCheck has invalid stamp, but allowing (PAPER delivery)" }
                     } else {
-                        println("[LXMRouter] Message from $sourceHashHexForCheck failed stamp validation (required cost: $requiredCost)")
+                        RnsLog.error("LXMRouter") { "Message from $sourceHashHexForCheck failed stamp validation (required cost: $requiredCost)" }
                         return
                     }
                 }
@@ -1632,7 +2161,7 @@ class LXMRouter(
                             publicKey = remoteIdentity.getPublicKey(),
                             appData = null,
                         )
-                        println("[LXMRouter] Stored identity from link for LXMF dest: $sourceHashHex")
+                        RnsLog.debug("LXMRouter") { "Stored identity from link for LXMF dest: $sourceHashHex" }
                     }
                 }
             }
@@ -1718,7 +2247,7 @@ class LXMRouter(
             // Invoke delivery callback
             deliveryCallback?.invoke(message)
         } catch (e: Exception) {
-            println("Error processing inbound delivery: ${e.message}")
+            RnsLog.error("LXMRouter") { "Error processing inbound delivery: ${e.message}" }
         }
     }
 
@@ -1786,7 +2315,7 @@ class LXMRouter(
                 }
             }
         } catch (e: Exception) {
-            println("Error parsing delivery announce: ${e.message}")
+            RnsLog.error("LXMRouter") { "Error parsing delivery announce: ${e.message}" }
         }
 
         // Trigger retry for pending DIRECT/OPPORTUNISTIC messages to this
@@ -1850,7 +2379,7 @@ class LXMRouter(
                             cleanAvailableTickets()
                         }
                     } catch (e: Exception) {
-                        println("Error in processing loop: ${e.message}")
+                        RnsLog.error("LXMRouter") { "Error in processing loop: ${e.message}" }
                     }
                     delay(PROCESSING_INTERVAL)
                 }
@@ -1982,7 +2511,7 @@ class LXMRouter(
             val arraySize = unpacker.unpackArrayHeader()
 
             if (arraySize < 7) {
-                println("Invalid propagation announce: expected 7 fields, got $arraySize")
+                RnsLog.warn("LXMRouter") { "Invalid propagation announce: expected 7 fields, got $arraySize" }
                 return
             }
 
@@ -2062,9 +2591,9 @@ class LXMRouter(
 
             propagationNodes[node.hexHash] = node
             savePropagationNodes()
-            println("Discovered propagation node: ${node.hexHash} (${displayName ?: "unnamed"})")
+            RnsLog.debug("LXMRouter") { "Discovered propagation node: ${node.hexHash} (${displayName ?: "unnamed"})" }
         } catch (e: Exception) {
-            println("Error parsing propagation announce: ${e.message}")
+            RnsLog.error("LXMRouter") { "Error parsing propagation announce: ${e.message}" }
         }
     }
 
@@ -2091,9 +2620,9 @@ class LXMRouter(
                         isActive = true,
                     )
                 propagationNodes[destHashHex] = node
-                println("Created minimal propagation node entry from recalled identity: $destHashHex")
+                RnsLog.debug("LXMRouter") { "Created minimal propagation node entry from recalled identity: $destHashHex" }
             } else {
-                println("Cannot set propagation node: no announce and no recalled identity for $destHashHex")
+                RnsLog.error("LXMRouter") { "Cannot set propagation node: no announce and no recalled identity for $destHashHex" }
                 // Still save the hash — the announce may arrive later
                 activePropagationNodeHash = destHashHex
                 return true
@@ -2105,7 +2634,7 @@ class LXMRouter(
         outboundPropagationLink?.teardown()
         outboundPropagationLink = null
 
-        println("Active propagation node set to: $destHashHex")
+        RnsLog.debug("LXMRouter") { "Active propagation node set to: $destHashHex" }
         return true
     }
 
@@ -2130,7 +2659,7 @@ class LXMRouter(
         val identity = Identity.recall(destHash) ?: return null
         val node = PropagationNode(destHash = destHash, identity = identity, isActive = true)
         propagationNodes[hash] = node
-        println("Late-recalled propagation node identity for $hash")
+        RnsLog.debug("LXMRouter") { "Late-recalled propagation node identity for $hash" }
         return node
     }
 
@@ -2149,7 +2678,7 @@ class LXMRouter(
      */
     fun addPropagationNode(node: PropagationNode) {
         propagationNodes[node.hexHash] = node
-        println("Added propagation node: ${node.hexHash} (${node.displayName ?: "unnamed"})")
+        RnsLog.debug("LXMRouter") { "Added propagation node: ${node.hexHash} (${node.displayName ?: "unnamed"})" }
     }
 
     /**
@@ -2184,7 +2713,7 @@ class LXMRouter(
             if (hash != null) {
                 val destHash = hash.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
                 Transport.requestPath(destHash)
-                println("Propagation node identity not available, requested path for $hash")
+                RnsLog.debug("LXMRouter") { "Propagation node identity not available, requested path for $hash" }
             }
             propagationTransferState = PropagationTransferState.FAILED
             return
@@ -2196,7 +2725,7 @@ class LXMRouter(
 
         // Check if we have an active link
         val link = outboundPropagationLink
-        println("[LXMRouter] requestMessages: link=${link != null}, status=${link?.status}, node=${node.hexHash.take(12)}")
+        RnsLog.debug("LXMRouter") { "requestMessages: link=${link != null}, status=${link?.status}, node=${node.hexHash.take(12)}" }
         if (link != null && link.status == LinkConstants.ACTIVE) {
             propagationTransferState = PropagationTransferState.LINK_ESTABLISHED
             // Mirror python LXMRouter.py:494 — identify on the link before
@@ -2211,7 +2740,7 @@ class LXMRouter(
             // Need to establish link first
             establishPropagationLink(node)
         }
-        println("[LXMRouter] requestMessages: returning, state=$propagationTransferState")
+        RnsLog.debug("LXMRouter") { "requestMessages: returning, state=$propagationTransferState" }
     }
 
     /**
@@ -2239,13 +2768,13 @@ class LXMRouter(
                     appName = APP_NAME,
                     PROPAGATION_ASPECT,
                 )
-            println("establishPropagationLink: dest=${destination.hexHash}, hasPath=${Transport.hasPath(node.destHash)}")
+            RnsLog.debug("LXMRouter") { "establishPropagationLink: dest=${destination.hexHash}, hasPath=${Transport.hasPath(node.destHash)}" }
 
             val link =
                 Link.create(
                     destination = destination,
                     establishedCallback = { establishedLink ->
-                        println("establishPropagationLink: LINK ESTABLISHED!")
+                        RnsLog.debug("LXMRouter") { "establishPropagationLink: LINK ESTABLISHED!" }
                         outboundPropagationLink = establishedLink
                         propagationTransferState = PropagationTransferState.LINK_ESTABLISHED
 
@@ -2263,7 +2792,7 @@ class LXMRouter(
                             // The identify packet may not have been processed yet by the
                             // remote node. If we get ERROR_NO_IDENTITY, handleMessageListResponse
                             // will retry after a brief delay to let identify propagate.
-                            println("[LXMRouter] Calling requestMessageList on established link")
+                            RnsLog.debug("LXMRouter") { "Calling requestMessageList on established link" }
                             requestMessageList(establishedLink)
                         } else {
                             // Delivery path: do NOT identify on the link.
@@ -2312,7 +2841,7 @@ class LXMRouter(
 
             outboundPropagationLink = link
         } catch (e: Exception) {
-            println("Failed to establish propagation link: ${e.message}")
+            RnsLog.error("LXMRouter") { "Failed to establish propagation link: ${e.message}" }
             e.printStackTrace()
             propagationTransferState = PropagationTransferState.FAILED
         }
@@ -2323,7 +2852,7 @@ class LXMRouter(
      */
     private fun requestMessageList(link: Link) {
         propagationTransferState = PropagationTransferState.LISTING_MESSAGES
-        println("[LXMRouter] requestMessageList: link.status=${link.status}, path=${LXMFConstants.MESSAGE_GET_PATH}")
+        RnsLog.debug("LXMRouter") { "requestMessageList: link.status=${link.status}, path=${LXMFConstants.MESSAGE_GET_PATH}" }
 
         try {
             // Send LIST request: [None, None]
@@ -2336,26 +2865,25 @@ class LXMRouter(
                     data = requestData,
                     responseCallback = { receipt ->
                         val responseData = receipt.response
-                        println(
-                            "[LXMRouter] messageList response: size=${responseData?.size}, hex=${responseData?.take(
-                                20,
-                            )?.joinToString("") { "%02x".format(it) }}",
-                        )
+                        RnsLog.debug("LXMRouter") {
+                            "messageList response: size=${responseData?.size}, " +
+                                "hex=${responseData?.take(20)?.joinToString("") { "%02x".format(it) }}"
+                        }
                         if (responseData != null) {
                             handleMessageListResponse(link, responseData)
                         } else {
                             propagationTransferState = PropagationTransferState.FAILED
-                            println("[LXMRouter] Message list request returned null response")
+                            RnsLog.debug("LXMRouter") { "Message list request returned null response" }
                         }
                     },
                     failedCallback = { _ ->
                         propagationTransferState = PropagationTransferState.FAILED
-                        println("Message list request failed")
+                        RnsLog.error("LXMRouter") { "Message list request failed" }
                     },
                 )
-            println("[LXMRouter] requestMessageList: receipt=$receipt")
+            RnsLog.debug("LXMRouter") { "requestMessageList: receipt=$receipt" }
         } catch (e: Exception) {
-            println("[LXMRouter] requestMessageList EXCEPTION: ${e.message}")
+            RnsLog.debug("LXMRouter") { "requestMessageList EXCEPTION: ${e.message}" }
             e.printStackTrace()
             propagationTransferState = PropagationTransferState.FAILED
         }
@@ -2386,13 +2914,13 @@ class LXMRouter(
                 // packet has been processed. Retry with backoff.
                 if (messageListRetryCount < MAX_MESSAGE_LIST_RETRIES) {
                     messageListRetryCount++
-                    println("Propagation node returned error $errorCode, retrying ($messageListRetryCount/$MAX_MESSAGE_LIST_RETRIES)...")
+                    RnsLog.error("LXMRouter") { "Propagation node returned error $errorCode, retrying ($messageListRetryCount/$MAX_MESSAGE_LIST_RETRIES)..." }
                     processingScope.launch {
                         kotlinx.coroutines.delay(MESSAGE_LIST_RETRY_DELAY_MS * messageListRetryCount)
                         requestMessageList(link)
                     }
                 } else {
-                    println("Propagation node returned error $errorCode after $MAX_MESSAGE_LIST_RETRIES retries")
+                    RnsLog.error("LXMRouter") { "Propagation node returned error $errorCode after $MAX_MESSAGE_LIST_RETRIES retries" }
                     propagationTransferState = PropagationTransferState.FAILED
                     messageListRetryCount = 0
                 }
@@ -2423,14 +2951,14 @@ class LXMRouter(
                 propagationTransferState = PropagationTransferState.COMPLETE
                 propagationTransferProgress = 1.0
                 propagationTransferLastResult = 0
-                println("No new messages from propagation node")
+                RnsLog.debug("LXMRouter") { "No new messages from propagation node" }
                 return
             }
 
             // Request the messages we want
             requestMessages(link, wantedIds)
         } catch (e: Exception) {
-            println("Error parsing message list: ${e.message}")
+            RnsLog.error("LXMRouter") { "Error parsing message list: ${e.message}" }
             propagationTransferState = PropagationTransferState.FAILED
         }
     }
@@ -2463,16 +2991,16 @@ class LXMRouter(
                         handleMessageGetResponse(link, responseData, wantedIds.size)
                     } else {
                         propagationTransferState = PropagationTransferState.FAILED
-                        println("Message get request returned null response")
+                        RnsLog.debug("LXMRouter") { "Message get request returned null response" }
                     }
                 },
                 failedCallback = { _ ->
                     propagationTransferState = PropagationTransferState.FAILED
-                    println("Message get request failed")
+                    RnsLog.error("LXMRouter") { "Message get request failed" }
                 },
             )
         } catch (e: Exception) {
-            println("Failed to request messages: ${e.message}")
+            RnsLog.error("LXMRouter") { "Failed to request messages: ${e.message}" }
             propagationTransferState = PropagationTransferState.FAILED
         }
     }
@@ -2495,7 +3023,7 @@ class LXMRouter(
             // Check for error response
             if (unpacker.nextFormat.valueType == org.msgpack.value.ValueType.INTEGER) {
                 val errorCode = unpacker.unpackInt()
-                println("Propagation node returned error: $errorCode")
+                RnsLog.error("LXMRouter") { "Propagation node returned error: $errorCode" }
                 propagationTransferState = PropagationTransferState.FAILED
                 return
             }
@@ -2534,11 +3062,11 @@ class LXMRouter(
                         path = LXMFConstants.MESSAGE_GET_PATH,
                         data = listOf(null, receivedHashes),
                         failedCallback = { _ ->
-                            println("Failed to send deletion acknowledgment to propagation node")
+                            RnsLog.error("LXMRouter") { "Failed to send deletion acknowledgment to propagation node" }
                         },
                     )
                 } catch (e: Exception) {
-                    println("Error sending deletion acknowledgment: ${e.message}")
+                    RnsLog.error("LXMRouter") { "Error sending deletion acknowledgment: ${e.message}" }
                 }
             }
 
@@ -2546,9 +3074,9 @@ class LXMRouter(
             propagationTransferProgress = 1.0
             propagationTransferLastResult = receivedCount
 
-            println("Received $receivedCount messages from propagation node")
+            RnsLog.debug("LXMRouter") { "Received $receivedCount messages from propagation node" }
         } catch (e: Exception) {
-            println("Error processing received messages: ${e.message}")
+            RnsLog.error("LXMRouter") { "Error processing received messages: ${e.message}" }
             propagationTransferState = PropagationTransferState.FAILED
         }
     }
@@ -2597,7 +3125,7 @@ class LXMRouter(
                 }
                 triggerProcessing()
             } catch (e: Exception) {
-                println("[LXMRouter] Error generating deferred stamp for $messageIdHex: ${e.message}")
+                RnsLog.error("LXMRouter") { "Error generating deferred stamp for $messageIdHex: ${e.message}" }
                 // Leave in deferred queue for retry
             }
         }
@@ -2749,7 +3277,7 @@ class LXMRouter(
 
             File(dir, "outbound_stamp_costs").writeBytes(buffer.toByteArray())
         } catch (e: Exception) {
-            println("[LXMRouter] Could not save outbound stamp costs: ${e.message}")
+            RnsLog.debug("LXMRouter") { "Could not save outbound stamp costs: ${e.message}" }
         }
     }
 
@@ -2790,7 +3318,7 @@ class LXMRouter(
             // Clean expired entries on load
             cleanOutboundStampCosts()
         } catch (e: Exception) {
-            println("[LXMRouter] Could not load outbound stamp costs: ${e.message}")
+            RnsLog.debug("LXMRouter") { "Could not load outbound stamp costs: ${e.message}" }
             outboundStampCosts.clear()
         }
     }
@@ -2854,7 +3382,7 @@ class LXMRouter(
             packer.close()
             File(dir, "available_tickets").writeBytes(buffer.toByteArray())
         } catch (e: Exception) {
-            println("[LXMRouter] Could not save available tickets: ${e.message}")
+            RnsLog.debug("LXMRouter") { "Could not save available tickets: ${e.message}" }
         }
     }
 
@@ -2939,7 +3467,7 @@ class LXMRouter(
             }
             unpacker.close()
         } catch (e: Exception) {
-            println("[LXMRouter] Could not load available tickets: ${e.message}")
+            RnsLog.debug("LXMRouter") { "Could not load available tickets: ${e.message}" }
             outboundTickets.clear()
             inboundTickets.clear()
             lastTicketDeliveries.clear()
@@ -2972,7 +3500,7 @@ class LXMRouter(
 
             File(dir, "local_deliveries").writeBytes(buffer.toByteArray())
         } catch (e: Exception) {
-            println("[LXMRouter] Could not save transient IDs: ${e.message}")
+            RnsLog.debug("LXMRouter") { "Could not save transient IDs: ${e.message}" }
         }
     }
 
@@ -3005,7 +3533,7 @@ class LXMRouter(
             }
             unpacker.close()
         } catch (e: Exception) {
-            println("[LXMRouter] Could not load transient IDs: ${e.message}")
+            RnsLog.debug("LXMRouter") { "Could not load transient IDs: ${e.message}" }
             locallyDeliveredTransientIds.clear()
         }
     }
@@ -3139,7 +3667,7 @@ class LXMRouter(
                 saveOutboundStampCostsAsync()
             }
         } catch (e: Exception) {
-            println("[LXMRouter] Error cleaning outbound stamp costs: ${e.message}")
+            RnsLog.error("LXMRouter") { "Error cleaning outbound stamp costs: ${e.message}" }
         }
     }
 
@@ -3171,7 +3699,7 @@ class LXMRouter(
                 ticketMap.isEmpty()
             }
         } catch (e: Exception) {
-            println("[LXMRouter] Error cleaning available tickets: ${e.message}")
+            RnsLog.error("LXMRouter") { "Error cleaning available tickets: ${e.message}" }
         }
     }
 
@@ -3192,7 +3720,7 @@ class LXMRouter(
         try {
             val schema = "${LXMFConstants.URI_SCHEMA}://"
             if (!uri.lowercase().startsWith(schema)) {
-                println("[LXMRouter] Cannot ingest LXM, invalid URI provided")
+                RnsLog.error("LXMRouter") { "Cannot ingest LXM, invalid URI provided" }
                 return false
             }
 
@@ -3209,17 +3737,17 @@ class LXMRouter(
 
             // Check for duplicates
             if (locallyDeliveredTransientIds.containsKey(transientIdHex)) {
-                println("[LXMRouter] Paper message already delivered, ignoring duplicate")
+                RnsLog.debug("LXMRouter") { "Paper message already delivered, ignoring duplicate" }
                 return false
             }
 
             // Process as inbound delivery (no stamp enforcement for paper messages)
             processInboundDelivery(lxmfData, DeliveryMethod.PAPER)
 
-            println("[LXMRouter] Ingested paper message with transient ID ${transientIdHex.take(12)}")
+            RnsLog.debug("LXMRouter") { "Ingested paper message with transient ID ${transientIdHex.take(12)}" }
             return true
         } catch (e: Exception) {
-            println("[LXMRouter] Error decoding URI-encoded LXMF message: ${e.message}")
+            RnsLog.error("LXMRouter") { "Error decoding URI-encoded LXMF message: ${e.message}" }
             return false
         }
     }
@@ -3309,9 +3837,9 @@ class LXMRouter(
             }
             packer.close()
             file.writeBytes(buffer.toByteArray())
-            println("Saved ${nodes.size} propagation nodes to ${file.name}")
+            RnsLog.debug("LXMRouter") { "Saved ${nodes.size} propagation nodes to ${file.name}" }
         } catch (e: Exception) {
-            println("Error saving propagation nodes: ${e.message}")
+            RnsLog.error("LXMRouter") { "Error saving propagation nodes: ${e.message}" }
         }
     }
 
@@ -3378,9 +3906,9 @@ class LXMRouter(
                 }
             }
             unpacker.close()
-            println("Loaded $loaded propagation nodes from ${file.name}")
+            RnsLog.debug("LXMRouter") { "Loaded $loaded propagation nodes from ${file.name}" }
         } catch (e: Exception) {
-            println("Error loading propagation nodes: ${e.message}")
+            RnsLog.error("LXMRouter") { "Error loading propagation nodes: ${e.message}" }
         }
     }
 

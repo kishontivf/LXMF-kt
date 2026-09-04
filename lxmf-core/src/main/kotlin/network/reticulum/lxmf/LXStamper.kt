@@ -2,6 +2,7 @@ package network.reticulum.lxmf
 
 import network.reticulum.crypto.Hashes
 import network.reticulum.discovery.Stamper
+import network.reticulum.common.RnsLog
 
 /**
  * LXMF Stamp Generator and Validator.
@@ -67,11 +68,11 @@ object LXStamper {
         stampCost: Int,
         expandRounds: Int = WORKBLOCK_EXPAND_ROUNDS
     ): StampResult {
-        println("[$TAG] Generating workblock with $expandRounds rounds...")
+        RnsLog.debug("LXStamper") { "[$TAG] Generating workblock with $expandRounds rounds..." }
         val workblockStart = System.currentTimeMillis()
         val workblock = generateWorkblock(messageId, expandRounds)
         val workblockTime = System.currentTimeMillis() - workblockStart
-        println("[$TAG] Workblock generated in ${workblockTime}ms (${workblock.size} bytes)")
+        RnsLog.debug("LXStamper") { "[$TAG] Workblock generated in ${workblockTime}ms (${workblock.size} bytes)" }
 
         return generateStamp(workblock, stampCost)
     }
