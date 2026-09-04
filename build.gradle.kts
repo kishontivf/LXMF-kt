@@ -4,8 +4,8 @@ plugins {
 }
 
 allprojects {
-    group = "com.github.torlando-tech.LXMF-kt"
-    version = System.getenv("VERSION")?.removePrefix("v") ?: "0.1.0-SNAPSHOT"
+    group = "com.github.kishontivf.LXMF-kt"
+    version = System.getenv("VERSION")?.removePrefix("v") ?: "0.2.0-SNAPSHOT"
 }
 
 subprojects {
