@@ -11,8 +11,8 @@ dependencies {
     // Must match the rns-core/rns-interfaces version :lxmf-core depends on. A mismatch here
     // ships the bridge an older Resource implementation than the tests running against it
     // exercise, which has bitten this module before — so these move with lxmf-core, always.
-    implementation("com.github.kishontivf.reticulum-kt:rns-core:0.1.0")
-    implementation("com.github.kishontivf.reticulum-kt:rns-interfaces:0.1.0")
+    implementation("com.github.kishontivf.reticulum-kt:rns-core:0.2.0")
+    implementation("com.github.kishontivf.reticulum-kt:rns-interfaces:0.2.0")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutinesVersion")
     implementation("org.json:json:20231013")

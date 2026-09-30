@@ -156,8 +156,11 @@ class LXMRouter(
          * Long enough not to interrupt a slow but working transfer — an image-sized payload can
          * take tens of seconds over a constrained carrier — and short enough that a transfer whose
          * link died is not simply lost.
+         *
+         * Measured from the latest send: every Resource send sets `nextDeliveryAttempt` to the
+         * moment it was made, so the rule fires once per stall and not on every pass after it.
          */
-        private const val SENDING_STALL_TIMEOUT = 120000L
+        internal const val SENDING_STALL_TIMEOUT = 120000L
 
         /**
          * How long a link may sit unestablished before the message waiting on it gives up on it.
@@ -271,7 +274,12 @@ class LXMRouter(
     private val pendingLinkEstablishments = ConcurrentHashMap<String, Long>()
 
 
-    /** Pending resource transfers: message_hash -> (message, resource) */
+    /**
+     * Pending resource transfers: message_hash -> (message, resource).
+     *
+     * One live Resource per message. A send cancels the Resource it replaces before starting a
+     * new one, and a Resource's callbacks act only while it is still the message's entry here.
+     */
     private val pendingResources = ConcurrentHashMap<String, Pair<LXMessage, Resource>>()
 
     // ===== Propagation Node Tracking =====
@@ -719,6 +727,7 @@ class LXMRouter(
             val toRemove = mutableListOf<LXMessage>()
             val toDispatch = mutableListOf<LXMessage>()
             val toFailCallback = mutableListOf<LXMessage>()
+            val stalled = mutableListOf<LXMessage>()
             val currentTime = System.currentTimeMillis()
 
             // Classify current pendingOutbound under the queue lock. Do NOT
@@ -829,8 +838,15 @@ class LXMRouter(
                             if (currentTime - (message.nextDeliveryAttempt ?: currentTime) > SENDING_STALL_TIMEOUT) {
                                 RnsLog.warn("LXMRouter") { "A resource to ${message.destinationHash.toHexString()} stalled; sending it again" }
 
+                                // A stall resend is a delivery attempt like any other. Counting
+                                // it means a peer that never answers a Resource parks the message
+                                // at MAX_DELIVERY_ATTEMPTS instead of being sent to for as long
+                                // as the link lives. The send itself moves nextDeliveryAttempt,
+                                // so this fires once per stall rather than on every pass.
+                                message.deliveryAttempts++
                                 message.state = MessageState.OUTBOUND
 
+                                stalled.add(message)
                                 toDispatch.add(message)
                             }
                         }
@@ -843,6 +859,14 @@ class LXMRouter(
 
                 // Remove processed messages
                 pendingOutbound.removeAll(toRemove)
+            }
+
+            // A stalled Resource is cancelled before its message is sent again, whatever the
+            // resend then does: left alive, it keeps its thread, and its eventual failure would
+            // reschedule a message that may since have parked. Outside the lock, because a
+            // cancel sends a packet.
+            for (message in stalled) {
+                cancelPendingResource(message.hash?.toHexString() ?: "")
             }
 
             // Dispatch per-message delivery OUTSIDE the queue lock. This is
@@ -894,6 +918,16 @@ class LXMRouter(
     /** Test seam: the current DIRECT delivery link for a destination, if any. */
     @org.jetbrains.annotations.VisibleForTesting
     internal fun directLinkForTest(destHashHex: String): Link? = directLinks[destHashHex]
+
+    /** Test seam: registers [link] as the DIRECT delivery link this side opened to a destination. */
+    @org.jetbrains.annotations.VisibleForTesting
+    internal fun setDirectLinkForTest(destHashHex: String, link: Link) {
+        directLinks[destHashHex] = link
+    }
+
+    /** Test seam: the Resource in flight for a message, if any. */
+    @org.jetbrains.annotations.VisibleForTesting
+    internal fun pendingResourceForTest(messageHashHex: String): Resource? = pendingResources[messageHashHex]?.second
 
     /**
      * Process a single outbound message based on its delivery method.
@@ -1888,39 +1922,78 @@ class LXMRouter(
         } else {
             // Send as resource for large messages
             // Python's __as_resource() sends self.packed (full message including dest hash)
+            val messageHashHex = message.hash?.toHexString() ?: ""
+
             try {
-                val messageHashHex = message.hash?.toHexString() ?: ""
+                // One live Resource per message. The one this send replaces is cancelled first,
+                // so its advertise thread ends and its callbacks find it is no longer the entry.
+                cancelPendingResource(messageHashHex)
+
                 val resource =
                     Resource.create(
                         data = packed, // Full packed message, matches Python's __as_resource()
                         link = link,
+                        advertise = false,
                         callback = { completedResource ->
-                            // Resource transfer complete
-                            pendingResources.remove(messageHashHex)
-                            message.state = MessageState.DELIVERED
-                            message.progress = 1.0
-                            message.deliveryCallback?.invoke(message)
+                            // Resource transfer complete. A replaced Resource's completion
+                            // changes nothing.
+                            if (isLiveResource(messageHashHex, completedResource)) {
+                                pendingResources.remove(messageHashHex)
+                                message.state = MessageState.DELIVERED
+                                message.progress = 1.0
+                                message.deliveryCallback?.invoke(message)
+                            }
                         },
                         progressCallback = { progressResource ->
                             // Update progress (Resource provides progress as 0.0-1.0 Float)
-                            message.progress = progressResource.progress.toDouble()
+                            if (isLiveResource(messageHashHex, progressResource)) {
+                                message.progress = progressResource.progress.toDouble()
+                            }
                         },
                     )
-                resource.callbacks.failed = {
-                    pendingResources.remove(messageHashHex)
+                resource.callbacks.failed = { failedResource ->
+                    if (isLiveResource(messageHashHex, failedResource)) {
+                        pendingResources.remove(messageHashHex)
 
-                    retryAfterUnproven(message, "A resource transfer failed")
+                        retryAfterUnproven(message, "A resource transfer failed")
+                    }
                 }
 
-                // Track resource for completion
+                // Track the resource before it is advertised, so a callback can never find the
+                // entry missing. The stall rule measures from this moment.
                 pendingResources[messageHashHex] = Pair(message, resource)
                 message.state = MessageState.SENDING
+                message.nextDeliveryAttempt = System.currentTimeMillis()
+
+                resource.advertise()
             } catch (e: Exception) {
                 RnsLog.error("LXMRouter") { "Failed to send resource via link: ${e.message}" }
+                cancelPendingResource(messageHashHex)
                 message.state = MessageState.OUTBOUND
                 message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
             }
         }
+    }
+
+    /**
+     * Whether [resource] is still the Resource in flight for the message with [messageHashHex].
+     *
+     * A Resource that a later send replaced is not allowed to move the message any more.
+     */
+    private fun isLiveResource(messageHashHex: String, resource: Resource): Boolean =
+        pendingResources[messageHashHex]?.second === resource
+
+    /**
+     * Cancels the Resource in flight for the message with [messageHashHex], if there is one.
+     *
+     * The entry leaves [pendingResources] before the cancel, because `Resource.cancel` fires the
+     * failed callback at once; the callback then finds the Resource is no longer live and does
+     * nothing. A cancelled `QUEUED` Resource also leaves its advertise loop, which ends its thread.
+     */
+    private fun cancelPendingResource(messageHashHex: String) {
+        val stale = pendingResources.remove(messageHashHex) ?: return
+
+        stale.second.cancel()
     }
 
     // ===== Inbound Message Handling =====
@@ -2142,10 +2215,14 @@ class LXMRouter(
                 }
             }
 
-            // Store backchannel link and identity for replies
+            // Store the sender's identity for replies. The link itself is not made a backchannel
+            // here: as in Python, a link becomes one only when its remote identifies on it
+            // (`delivery_remote_identified`), which [handleDeliveryLinkEstablished] handles. A
+            // link whose opener never identifies — LXMF-swift 0.8.0 never does — may not accept
+            // a Resource from this side, so a reply over it would time out and be sent again
+            // for as long as the link lives.
             if (link != null) {
                 val sourceHashHex = message.sourceHash.toHexString()
-                backchannelLinks[sourceHashHex] = link
 
                 // If the link has a remote identity, store it so Identity.recall() works
                 // This is needed for echo/reply functionality
