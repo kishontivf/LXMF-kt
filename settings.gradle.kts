@@ -12,11 +12,12 @@ dependencyResolutionManagement {
         // This is a fork, and it builds against OUR reticulum-kt fork rather than upstream's
         // published tags: the two diverge together, and a diagnostic added to one is used by the
         // other. `./gradlew publishToMavenLocal` in the reticulum-kt-kishontivf checkout is what
-        // puts it here. Scoped to that group so nothing else resolves out of a directory whose
-        // contents are whatever was last built.
+        // puts it here. Scoped to that group's SNAPSHOT versions, so a release number always comes
+        // from JitPack and nothing else resolves out of a directory whose contents are whatever
+        // was last built.
         mavenLocal {
             content {
-                includeGroupByRegex("com\\.github\\.torlando-tech.*")
+                includeVersionByRegex("com\\.github\\.kishontivf\\.reticulum-kt", ".*", ".*-SNAPSHOT")
             }
         }
         google()
