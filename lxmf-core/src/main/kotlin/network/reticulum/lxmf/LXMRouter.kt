@@ -106,12 +106,17 @@ class LXMRouter(
         const val MAX_PATHLESS_TRIES = 1
 
         /**
-         * How old an undelivered message may get before it is failed, in milliseconds.
+         * How long a message may wait in the queue after hand-over before it is failed, in
+         * milliseconds.
          *
          * **The only terminal bound in the outbound path.** Everything else reschedules. A day is
          * chosen against the case this router exists for: a peer that is simply not switched on.
          * Failing a message because the recipient's phone was in a drawer over lunch is the wrong
          * answer, and it is the answer an attempt-count bound gives.
+         *
+         * Counted from [LXMessage.handedOverAt], the moment [handleOutbound] took the message, and
+         * not from its timestamp. A caller that keeps a message over a restart hands it over again
+         * with its original timestamp, so the hash stays the same, and it gets a fresh day.
          */
         const val MAX_OUTBOUND_AGE = 24L * 60 * 60 * 1000
 
@@ -146,9 +151,6 @@ class LXMRouter(
          * about.
          */
         const val UNPROVEN_ROUTE_RETRY_WAIT = 300000L
-
-        /** LXMF timestamps are epoch *seconds* as a Double; the queue works in milliseconds. */
-        private const val MILLIS_PER_SECOND = 1000
 
         /**
          * How long a resource transfer may sit in [MessageState.SENDING] before it is sent again.
@@ -213,12 +215,13 @@ class LXMRouter(
     // ===== Message Queues =====
     //
     // Lock ordering (to avoid deadlock on any future nested acquisition):
-    //   pendingOutboundMutex  →  failedOutboundMutex
+    //   outboundProcessingMutex  →  pendingOutboundMutex  →  failedOutboundMutex
     //
-    // Today the only nested site is inside [processOutbound] where a
-    // FAILED-state message is moved from pendingOutbound to failedOutbound.
-    // The reverse order is never acquired. Any new code that needs both
-    // mutexes MUST follow this order, or restructure to take them
+    // [processOutbound] takes the first two in that order, and moves a
+    // FAILED-state message from pendingOutbound to failedOutbound under the
+    // third. [cancelOutbound] takes the first two in the same order. The
+    // reverse order is never acquired. Any new code that needs more than one
+    // of these mutexes MUST follow this order, or restructure to take them
     // independently.
 
     /** Pending inbound messages awaiting processing */
@@ -241,23 +244,28 @@ class LXMRouter(
     //
     // All three are guarded by [retryStateLock]. Every critical section is a few map operations and
     // nothing suspends inside one.
+    //
+    // The per-message state is keyed by the queued instance, not by the message hash. A caller may
+    // queue one message twice under one hash: once direct, and once more for a propagation node
+    // when no proof came back in time. Each instance has its own schedule. [LXMessage] does not
+    // override `equals`, so the object itself is the key.
 
     private val retryStateLock = Any()
 
     /** When each destination's path was last thrown away, by destination hex hash. */
     private val lastPathInvalidation = mutableMapOf<String, Long>()
 
-    /** How many times in a row a message has been rescheduled for want of a path, by message hex hash. */
-    private val pathlessBackoffSteps = mutableMapOf<String, Int>()
+    /** How many times in a row a message has been rescheduled for want of a path, by queued instance. */
+    private val pathlessBackoffSteps = mutableMapOf<LXMessage, Int>()
 
     /**
      * Messages parked because their route absorbed a whole attempt budget without proving itself,
-     * by message hex hash.
+     * by queued instance.
      *
      * Released early by [wakeMessagesWithFreshPath] the moment a path to the destination exists
      * again, which is the difference between a park and a sentence.
      */
-    private val awaitingFreshPath = mutableSetOf<String>()
+    private val awaitingFreshPath = mutableSetOf<LXMessage>()
 
     // ===== Destinations and Links =====
 
@@ -275,12 +283,14 @@ class LXMRouter(
 
 
     /**
-     * Pending resource transfers: message_hash -> (message, resource).
+     * Pending resource transfers, by queued instance.
      *
-     * One live Resource per message. A send cancels the Resource it replaces before starting a
-     * new one, and a Resource's callbacks act only while it is still the message's entry here.
+     * One live Resource per queued instance. A send cancels the Resource it replaces before
+     * starting a new one, and a Resource's callbacks act only while it is still the instance's
+     * entry here. Keyed by the instance rather than by hash so that a message's direct send and
+     * its upload to a propagation node, which share a hash, each keep their own transfer.
      */
-    private val pendingResources = ConcurrentHashMap<String, Pair<LXMessage, Resource>>()
+    private val pendingResources = ConcurrentHashMap<LXMessage, Resource>()
 
     // ===== Propagation Node Tracking =====
 
@@ -387,8 +397,13 @@ class LXMRouter(
 
     // ===== Deferred Stamp Processing =====
 
-    /** Messages awaiting deferred stamp generation: messageIdHex -> LXMessage */
-    private val pendingDeferredStamps = ConcurrentHashMap<String, LXMessage>()
+    /**
+     * Messages awaiting deferred stamp generation.
+     *
+     * A message moves from here to [pendingOutbound] under [pendingOutboundMutex], so a cancel in
+     * the meantime finds it in one of the two places and never in neither.
+     */
+    private val pendingDeferredStamps: MutableSet<LXMessage> = ConcurrentHashMap.newKeySet()
 
     /** Mutex for stamp generation to prevent concurrent CPU-heavy work */
     private val stampGenMutex = Mutex()
@@ -654,6 +669,10 @@ class LXMRouter(
             }
         }
 
+        // The age limit counts from here, not from the message's timestamp, so a message handed
+        // over again after a restart gets a fresh day under its original hash.
+        message.handedOverAt = System.currentTimeMillis()
+
         // Set message state to outbound
         message.state = MessageState.OUTBOUND
 
@@ -699,9 +718,60 @@ class LXMRouter(
             triggerProcessing()
         } else {
             // Deferred: stamp will be generated in background
-            val messageIdHex = message.hash?.toHexString() ?: return
-            pendingDeferredStamps[messageIdHex] = message
+            pendingDeferredStamps.add(message)
         }
+    }
+
+    /**
+     * Takes one queued message out of the outbound queue and stops its transfer.
+     *
+     * This cancels the instance [message] itself, not every queued message with its hash. A
+     * message queued twice, once direct and once for a propagation node, keeps its other copy.
+     *
+     * The instance is removed under the queue lock, its state becomes [MessageState.CANCELLED],
+     * and the Resource it has in flight is cancelled. Nothing the router does afterwards puts it
+     * back: a receipt that times out, a link that closes, a stalled transfer and the resend of an
+     * unproven packet all act on queued instances only. No callback fires for a cancelled
+     * instance, with one exception: a delivery proof for a packet that was already in flight
+     * still calls [LXMessage.deliveryCallback], because the peer did receive the message.
+     *
+     * The call also holds the processing lock, so it waits for a dispatch pass in progress to
+     * end and no send can overlap the cancel. Do not call it with `runBlocking` from inside a
+     * router callback; launch a coroutine instead.
+     *
+     * Python's `cancel_outbound` is keyed by message id. See `port-deviations.md`.
+     *
+     * @param message the queued instance to cancel.
+     * @return true if the instance was still queued and is now cancelled. False if the router no
+     *   longer held it, or if a proof had already marked it delivered.
+     */
+    suspend fun cancelOutbound(message: LXMessage): Boolean {
+        val inFlight = outboundProcessingMutex.withLock {
+            pendingOutboundMutex.withLock {
+                val queued = pendingOutbound.any { it === message } || message in pendingDeferredStamps
+
+                // A proof that arrived before the cancel wins: the peer has the message.
+                if (!queued || message.state == MessageState.DELIVERED) return false
+
+                pendingOutbound.removeAll { it === message }
+                pendingDeferredStamps.remove(message)
+                message.state = MessageState.CANCELLED
+                forgetRetryState(message)
+
+                pendingResources.remove(message)
+            }
+        }
+
+        // Outside the locks, because a cancel sends a packet.
+        inFlight?.cancel()
+
+        RnsLog.debug("LXMRouter") { "Cancelled a queued message to ${message.destinationHash.toHexString()}" }
+
+        // A pass that tried to start while the cancel held the processing lock was skipped, so
+        // make it up rather than leave the other messages to the next tick.
+        triggerProcessing()
+
+        return true
     }
 
     /**
@@ -866,7 +936,7 @@ class LXMRouter(
             // reschedule a message that may since have parked. Outside the lock, because a
             // cancel sends a packet.
             for (message in stalled) {
-                cancelPendingResource(message.hash?.toHexString() ?: "")
+                cancelPendingResource(message)
             }
 
             // Dispatch per-message delivery OUTSIDE the queue lock. This is
@@ -915,6 +985,15 @@ class LXMRouter(
     @org.jetbrains.annotations.VisibleForTesting
     internal var testHookOnProcessOutboundMessage: (suspend (LXMessage) -> Unit)? = null
 
+    /**
+     * Test-only hook fired by [sendViaPropagation] just before it makes the propagation stamp.
+     * Exists so a test can hold a node upload at the point where its stamp would be made and
+     * prove that other messages are still dispatched meanwhile. Production code MUST NOT install
+     * this.
+     */
+    @org.jetbrains.annotations.VisibleForTesting
+    internal var testHookBeforePropagationStamp: (suspend (LXMessage) -> Unit)? = null
+
     /** Test seam: the current DIRECT delivery link for a destination, if any. */
     @org.jetbrains.annotations.VisibleForTesting
     internal fun directLinkForTest(destHashHex: String): Link? = directLinks[destHashHex]
@@ -925,9 +1004,15 @@ class LXMRouter(
         directLinks[destHashHex] = link
     }
 
-    /** Test seam: the Resource in flight for a message, if any. */
+    /** Test seam: registers [link] as the link to the active propagation node. */
     @org.jetbrains.annotations.VisibleForTesting
-    internal fun pendingResourceForTest(messageHashHex: String): Resource? = pendingResources[messageHashHex]?.second
+    internal fun setPropagationLinkForTest(link: Link) {
+        outboundPropagationLink = link
+    }
+
+    /** Test seam: the Resource in flight for a queued instance, if any. */
+    @org.jetbrains.annotations.VisibleForTesting
+    internal fun pendingResourceForTest(message: LXMessage): Resource? = pendingResources[message]
 
     /**
      * Process a single outbound message based on its delivery method.
@@ -1009,16 +1094,12 @@ class LXMRouter(
      * does not.
      */
     private fun rescheduleWithoutPath(message: LXMessage) {
-        val step = message.hash?.let { hash ->
-            val key = hash.toHexString()
+        val step = synchronized(retryStateLock) {
+            val current = pathlessBackoffSteps[message] ?: 0
+            pathlessBackoffSteps[message] = current + 1
 
-            synchronized(retryStateLock) {
-                val current = pathlessBackoffSteps[key] ?: 0
-                pathlessBackoffSteps[key] = current + 1
-
-                current
-            }
-        } ?: 0
+            current
+        }
 
         message.nextDeliveryAttempt = System.currentTimeMillis() + RetryBackoff.afterStep(step)
     }
@@ -1042,13 +1123,11 @@ class LXMRouter(
         message.state = MessageState.OUTBOUND
         message.nextDeliveryAttempt = System.currentTimeMillis() + UNPROVEN_ROUTE_RETRY_WAIT
 
-        message.hash?.toHexString()?.let { key ->
-            synchronized(retryStateLock) {
-                // The replacement route deserves a clean slate rather than inheriting the dead
-                // one's climb.
-                pathlessBackoffSteps[key] = 0
-                awaitingFreshPath.add(key)
-            }
+        synchronized(retryStateLock) {
+            // The replacement route deserves a clean slate rather than inheriting the dead
+            // one's climb.
+            pathlessBackoffSteps[message] = 0
+            awaitingFreshPath.add(message)
         }
 
         RnsLog.warn("LXMRouter") {
@@ -1068,7 +1147,7 @@ class LXMRouter(
      * @param queue the outbound queue, which the caller must already hold the lock on.
      */
     private fun wakeMessagesWithFreshPath(queue: List<LXMessage>) {
-        val live = queue.mapNotNull { it.hash?.toHexString() }.toSet()
+        val live = queue.toSet()
 
         synchronized(retryStateLock) {
             awaitingFreshPath.retainAll(live)
@@ -1092,13 +1171,11 @@ class LXMRouter(
         waiting.filter { it.destinationHash.toHexString() in reachable }.forEach { message ->
             message.nextDeliveryAttempt = now
 
-            message.hash?.toHexString()?.let { key ->
-                synchronized(retryStateLock) {
-                    awaitingFreshPath.remove(key)
-                    // The outage is over, so a later failure starts the curve again rather than
-                    // resuming a climb that belonged to it.
-                    pathlessBackoffSteps[key] = 0
-                }
+            synchronized(retryStateLock) {
+                awaitingFreshPath.remove(message)
+                // The outage is over, so a later failure starts the curve again rather than
+                // resuming a climb that belonged to it.
+                pathlessBackoffSteps[message] = 0
             }
 
             RnsLog.debug("LXMRouter") {
@@ -1108,18 +1185,20 @@ class LXMRouter(
     }
 
     /**
-     * Whether this message has been queued longer than [MAX_OUTBOUND_AGE] and should be given up on.
+     * Whether this message has waited longer than [MAX_OUTBOUND_AGE] since it was handed over and
+     * should be given up on.
      *
      * The single terminal bound in the outbound path, now that spending a delivery budget only
-     * costs the message its route. A message with no timestamp is never expired by age: it has no
-     * age to judge, and guessing one would fail messages for a missing field.
+     * costs the message its route. The age is counted from [LXMessage.handedOverAt], not from the
+     * message's timestamp: a message handed over again after a restart keeps its timestamp and
+     * its hash, and gets a fresh day. A message with no hand-over time is never expired by age.
      */
     private fun LXMessage.hasOutlivedTheQueue(now: Long): Boolean {
         if (state == MessageState.DELIVERED || state == MessageState.FAILED) return false
 
-        val createdAt = timestamp ?: return false
+        val since = handedOverAt ?: return false
 
-        return now - (createdAt * MILLIS_PER_SECOND).toLong() > MAX_OUTBOUND_AGE
+        return now - since > MAX_OUTBOUND_AGE
     }
 
     /**
@@ -1134,25 +1213,57 @@ class LXMRouter(
      *
      * The failed callback still fires, because callers want to know an attempt went unproven; what
      * changes is that the message stays in the queue and is sent again.
+     *
+     * Only a queued instance is put back. One that was cancelled, or that has left the queue
+     * since the attempt was made, is left as it is and its callback stays silent. The check and
+     * the reschedule run together under the queue lock, so this is safe to call from a receipt
+     * or Resource callback on any thread; the work itself runs on [processingScope].
      */
     private fun retryAfterUnproven(message: LXMessage, reason: String) {
-        RnsLog.debug("LXMRouter") { "$reason for ${message.destinationHash.toHexString()}; will try again" }
+        processingScope.launch {
+            val queued = ifStillQueued(message) {
+                message.state = MessageState.OUTBOUND
+                message.nextDeliveryAttempt = System.currentTimeMillis() +
+                    maxOf(DELIVERY_RETRY_WAIT, RetryBackoff.afterStep(message.deliveryAttempts))
+            }
 
-        message.state = MessageState.OUTBOUND
-        message.nextDeliveryAttempt = System.currentTimeMillis() +
-            maxOf(DELIVERY_RETRY_WAIT, RetryBackoff.afterStep(message.deliveryAttempts))
+            if (!queued) return@launch
 
-        message.failedCallback?.invoke(message)
+            RnsLog.debug("LXMRouter") { "$reason for ${message.destinationHash.toHexString()}; will try again" }
+
+            message.failedCallback?.invoke(message)
+        }
+    }
+
+    /**
+     * Runs [block] for [message] under the queue lock, but only while that instance is still queued.
+     *
+     * @param message the instance to act on.
+     * @param block what to do to it. Must not suspend.
+     * @return true if the instance was queued and [block] ran.
+     */
+    private suspend fun ifStillQueued(message: LXMessage, block: () -> Unit): Boolean =
+        pendingOutboundMutex.withLock {
+            val queued = pendingOutbound.any { it === message }
+
+            if (queued) block()
+
+            queued
+        }
+
+    /** Drops the route retry state of an instance that has left the queue. */
+    private fun forgetRetryState(message: LXMessage) {
+        synchronized(retryStateLock) {
+            pathlessBackoffSteps.remove(message)
+            awaitingFreshPath.remove(message)
+        }
     }
 
     /** Whether [message] is being held back by the absence of a route rather than by its own schedule. */
-    private fun isWaitingOnAPath(message: LXMessage): Boolean {
-        val key = message.hash?.toHexString() ?: return false
-
-        return synchronized(retryStateLock) {
-            key in awaitingFreshPath || (pathlessBackoffSteps[key] ?: 0) > 0
+    private fun isWaitingOnAPath(message: LXMessage): Boolean =
+        synchronized(retryStateLock) {
+            message in awaitingFreshPath || (pathlessBackoffSteps[message] ?: 0) > 0
         }
-    }
 
     /**
      * Process opportunistic message delivery.
@@ -1670,6 +1781,8 @@ class LXMRouter(
 
     /**
      * Handle a link being closed.
+     *
+     * Only queued instances are put back to OUTBOUND, so a cancelled one stays cancelled.
      */
     private fun handleLinkClosed(destHashHex: String) {
         processingScope.launch {
@@ -1744,7 +1857,16 @@ class LXMRouter(
             // Link exists and is ACTIVE -> send message (Python line 2678-2682)
             link != null && link.status == LinkConstants.ACTIVE -> {
                 if (message.state != MessageState.SENDING) {
-                    sendViaPropagation(message, link)
+                    // The upload needs a proof-of-work stamp, which takes seconds on a phone. It
+                    // is made on a coroutine of its own, outside the processing lock, so the
+                    // other messages in this pass and in the next ones keep moving. SENDING is
+                    // set here so no later pass starts a second upload meanwhile, and the stall
+                    // rule measures from now.
+                    message.state = MessageState.SENDING
+                    message.method = DeliveryMethod.PROPAGATED
+                    message.nextDeliveryAttempt = System.currentTimeMillis()
+
+                    processingScope.launch { sendViaPropagation(message, link) }
                 }
                 // If already SENDING, just wait for transfer to complete
             }
@@ -1782,52 +1904,25 @@ class LXMRouter(
     }
 
     /**
-     * Send a message via propagation node.
+     * Uploads a message to the propagation node over [link].
+     *
+     * Runs on its own coroutine, launched by [processPropagatedDelivery] with the message already
+     * in [MessageState.SENDING], because the stamp is proof of work and must not hold the
+     * processing lock. The Resource gets its callbacks and its entry in [pendingResources]
+     * before it advertises, so a failure in between cannot be lost. It is registered under the
+     * queue lock, and only while the instance is still queued and still SENDING: a cancel, a
+     * stall resend or a closed link during the stamp means the upload is dropped unsent.
      */
-    private fun sendViaPropagation(
+    private suspend fun sendViaPropagation(
         message: LXMessage,
         link: Link,
     ) {
         val packed = message.packed ?: return
 
-        message.state = MessageState.SENDING
-        message.method = DeliveryMethod.PROPAGATED
-
         try {
-            // Build propagation format matching Python LXMessage.pack() lines 434-441:
-            //   1. Encrypt: pn_encrypted = destination.encrypt(packed[DEST_LEN:])
-            //   2. Build:   lxm_data = destHash + pn_encrypted
-            //   3. Compute: transient_id = full_hash(lxm_data)
-            //   4. Stamp:   propagation_stamp = generate_stamp(transient_id, cost)
-            //   5. Wire:    transient_data = lxm_data + propagation_stamp
-            //
-            // Python's validate_pn_stamp() splits: lxm_data = data[:-STAMP_SIZE], stamp = data[-STAMP_SIZE:]
-            // Then: transient_id = full_hash(lxm_data), workblock = stamp_workblock(transient_id)
-            val destHash = packed.copyOfRange(0, LXMFConstants.DESTINATION_LENGTH)
-            val plainData = packed.copyOfRange(LXMFConstants.DESTINATION_LENGTH, packed.size)
+            testHookBeforePropagationStamp?.invoke(message)
 
-            val dest = message.destination
-                ?: throw IllegalStateException("Cannot propagate without destination")
-            val encryptedData = dest.encrypt(plainData)
-
-            // lxm_data = destHash + encrypted (this is what transient_id is computed from)
-            val lxmData = destHash + encryptedData
-
-            // Compute transient_id and generate propagation stamp against it
-            // (NOT against message.hash — the stamp must validate against transient_id)
-            val transientId = network.reticulum.crypto.Hashes.fullHash(lxmData)
-            val propStampResult = kotlinx.coroutines.runBlocking {
-                LXStamper.generateStampWithWorkblock(
-                    messageId = transientId,
-                    stampCost = getActivePropagationNode()?.stampCost ?: 8,
-                    expandRounds = LXStamper.WORKBLOCK_EXPAND_ROUNDS_PN,
-                )
-            }
-            val propStamp = propStampResult.stamp
-            RnsLog.debug("LXMRouter") { "Propagation stamp generated: value=${propStampResult.value}, cost=${getActivePropagationNode()?.stampCost}" }
-
-            // Append propagation stamp (Python strips last STAMP_SIZE bytes before computing transient_id)
-            val transientData = if (propStamp != null) lxmData + propStamp else lxmData
+            val transientData = packForPropagation(message, packed)
 
             // Pack for wire: msgpack([timebase, [transient_data, ...]])
             val buffer = java.io.ByteArrayOutputStream()
@@ -1845,34 +1940,123 @@ class LXMRouter(
 
             packer.close()
 
-            // Send as Resource (propagation transfers are always Resource-based)
+            // Send as Resource (propagation transfers are always Resource-based). Not advertised
+            // yet: the callbacks and the entry come first.
             val resource =
                 Resource.create(
                     data = buffer.toByteArray(),
                     link = link,
-                    callback = { _ ->
-                        // Transfer complete - for propagated messages, SENT is final
-                        message.state = MessageState.SENT
-                        message.deliveryCallback?.invoke(message)
+                    advertise = false,
+                    callback = { completedResource ->
+                        // Transfer complete - for propagated messages, SENT is final. A replaced
+                        // Resource's completion changes nothing.
+                        if (isLiveResource(message, completedResource)) {
+                            pendingResources.remove(message)
+                            message.state = MessageState.SENT
+                            message.deliveryCallback?.invoke(message)
+                        }
                     },
                     progressCallback = { progressResource ->
-                        message.progress = progressResource.progress.toDouble()
+                        if (isLiveResource(message, progressResource)) {
+                            message.progress = progressResource.progress.toDouble()
+                        }
                     },
                 )
+            resource.callbacks.failed = { failedResource ->
+                if (isLiveResource(message, failedResource)) {
+                    pendingResources.remove(message)
 
-            // Track the resource
-            val messageHashHex = message.hash?.toHexString() ?: ""
-            resource.callbacks.failed = {
-                pendingResources.remove(messageHashHex)
-
-                retryAfterUnproven(message, "A resource to a propagation node failed")
+                    retryAfterUnproven(message, "A resource to a propagation node failed")
+                }
             }
-            pendingResources[messageHashHex] = Pair(message, resource)
+
+            // The stamp took time, and the message may have been cancelled or sent again
+            // meanwhile. The entry is swapped under the queue lock, so a cancel is either
+            // before this, in which case the upload is dropped, or after it, in which case the
+            // cancel finds this Resource and stops it.
+            var replaced: Resource? = null
+            val wanted = pendingOutboundMutex.withLock {
+                val stillSending = pendingOutbound.any { it === message } && message.state == MessageState.SENDING
+
+                if (stillSending) replaced = pendingResources.put(message, resource)
+
+                stillSending
+            }
+
+            // Outside the lock, because a cancel sends a packet. The replaced Resource's failed
+            // callback finds it is no longer the entry and does nothing.
+            replaced?.cancel()
+
+            if (!wanted) {
+                // Never advertised, so there is nothing to tear down.
+                RnsLog.debug("LXMRouter") { "Dropping a node upload for ${message.destinationHash.toHexString()}: no longer wanted" }
+
+                return
+            }
+
+            resource.advertise()
+        } catch (e: CancellationException) {
+            // The router is closing; this is not a failed upload.
+            throw e
         } catch (e: Exception) {
             RnsLog.error("LXMRouter") { "Failed to send via propagation: ${e.message}" }
-            message.state = MessageState.OUTBOUND
-            message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
+
+            ifStillQueued(message) {
+                message.state = MessageState.OUTBOUND
+                message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
+            }
         }
+    }
+
+    /**
+     * Builds the bytes the propagation node takes for a message: the encrypted message with its
+     * proof-of-work stamp appended.
+     *
+     * The stamp is made under [stampGenMutex], so two uploads do not run their proof of work
+     * side by side. The wire format is unchanged.
+     *
+     * @param message the message to upload.
+     * @param packed the message's packed bytes.
+     * @return the transient data, as the node expects it.
+     * @throws IllegalStateException when the message has no destination to encrypt for.
+     */
+    private suspend fun packForPropagation(message: LXMessage, packed: ByteArray): ByteArray {
+        // Build propagation format matching Python LXMessage.pack() lines 434-441:
+        //   1. Encrypt: pn_encrypted = destination.encrypt(packed[DEST_LEN:])
+        //   2. Build:   lxm_data = destHash + pn_encrypted
+        //   3. Compute: transient_id = full_hash(lxm_data)
+        //   4. Stamp:   propagation_stamp = generate_stamp(transient_id, cost)
+        //   5. Wire:    transient_data = lxm_data + propagation_stamp
+        //
+        // Python's validate_pn_stamp() splits: lxm_data = data[:-STAMP_SIZE], stamp = data[-STAMP_SIZE:]
+        // Then: transient_id = full_hash(lxm_data), workblock = stamp_workblock(transient_id)
+        val destHash = packed.copyOfRange(0, LXMFConstants.DESTINATION_LENGTH)
+        val plainData = packed.copyOfRange(LXMFConstants.DESTINATION_LENGTH, packed.size)
+
+        val dest = message.destination
+            ?: throw IllegalStateException("Cannot propagate without destination")
+        val encryptedData = dest.encrypt(plainData)
+
+        // lxm_data = destHash + encrypted (this is what transient_id is computed from)
+        val lxmData = destHash + encryptedData
+
+        // Compute transient_id and generate propagation stamp against it
+        // (NOT against message.hash — the stamp must validate against transient_id)
+        val transientId = Hashes.fullHash(lxmData)
+        val stampCost = getActivePropagationNode()?.stampCost ?: 8
+        val propStampResult = stampGenMutex.withLock {
+            LXStamper.generateStampWithWorkblock(
+                messageId = transientId,
+                stampCost = stampCost,
+                expandRounds = LXStamper.WORKBLOCK_EXPAND_ROUNDS_PN,
+            )
+        }
+        val propStamp = propStampResult.stamp
+
+        RnsLog.debug("LXMRouter") { "Propagation stamp generated: value=${propStampResult.value}, cost=$stampCost" }
+
+        // Append propagation stamp (Python strips last STAMP_SIZE bytes before computing transient_id)
+        return if (propStamp != null) lxmData + propStamp else lxmData
     }
 
     /**
@@ -1922,12 +2106,11 @@ class LXMRouter(
         } else {
             // Send as resource for large messages
             // Python's __as_resource() sends self.packed (full message including dest hash)
-            val messageHashHex = message.hash?.toHexString() ?: ""
-
             try {
-                // One live Resource per message. The one this send replaces is cancelled first,
-                // so its advertise thread ends and its callbacks find it is no longer the entry.
-                cancelPendingResource(messageHashHex)
+                // One live Resource per queued instance. The one this send replaces is cancelled
+                // first, so its advertise thread ends and its callbacks find it is no longer the
+                // entry.
+                cancelPendingResource(message)
 
                 val resource =
                     Resource.create(
@@ -1937,8 +2120,8 @@ class LXMRouter(
                         callback = { completedResource ->
                             // Resource transfer complete. A replaced Resource's completion
                             // changes nothing.
-                            if (isLiveResource(messageHashHex, completedResource)) {
-                                pendingResources.remove(messageHashHex)
+                            if (isLiveResource(message, completedResource)) {
+                                pendingResources.remove(message)
                                 message.state = MessageState.DELIVERED
                                 message.progress = 1.0
                                 message.deliveryCallback?.invoke(message)
@@ -1946,14 +2129,14 @@ class LXMRouter(
                         },
                         progressCallback = { progressResource ->
                             // Update progress (Resource provides progress as 0.0-1.0 Float)
-                            if (isLiveResource(messageHashHex, progressResource)) {
+                            if (isLiveResource(message, progressResource)) {
                                 message.progress = progressResource.progress.toDouble()
                             }
                         },
                     )
                 resource.callbacks.failed = { failedResource ->
-                    if (isLiveResource(messageHashHex, failedResource)) {
-                        pendingResources.remove(messageHashHex)
+                    if (isLiveResource(message, failedResource)) {
+                        pendingResources.remove(message)
 
                         retryAfterUnproven(message, "A resource transfer failed")
                     }
@@ -1961,14 +2144,14 @@ class LXMRouter(
 
                 // Track the resource before it is advertised, so a callback can never find the
                 // entry missing. The stall rule measures from this moment.
-                pendingResources[messageHashHex] = Pair(message, resource)
+                pendingResources[message] = resource
                 message.state = MessageState.SENDING
                 message.nextDeliveryAttempt = System.currentTimeMillis()
 
                 resource.advertise()
             } catch (e: Exception) {
                 RnsLog.error("LXMRouter") { "Failed to send resource via link: ${e.message}" }
-                cancelPendingResource(messageHashHex)
+                cancelPendingResource(message)
                 message.state = MessageState.OUTBOUND
                 message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
             }
@@ -1976,24 +2159,24 @@ class LXMRouter(
     }
 
     /**
-     * Whether [resource] is still the Resource in flight for the message with [messageHashHex].
+     * Whether [resource] is still the Resource in flight for the queued instance [message].
      *
      * A Resource that a later send replaced is not allowed to move the message any more.
      */
-    private fun isLiveResource(messageHashHex: String, resource: Resource): Boolean =
-        pendingResources[messageHashHex]?.second === resource
+    private fun isLiveResource(message: LXMessage, resource: Resource): Boolean =
+        pendingResources[message] === resource
 
     /**
-     * Cancels the Resource in flight for the message with [messageHashHex], if there is one.
+     * Cancels the Resource in flight for the queued instance [message], if there is one.
      *
      * The entry leaves [pendingResources] before the cancel, because `Resource.cancel` fires the
      * failed callback at once; the callback then finds the Resource is no longer live and does
      * nothing. A cancelled `QUEUED` Resource also leaves its advertise loop, which ends its thread.
      */
-    private fun cancelPendingResource(messageHashHex: String) {
-        val stale = pendingResources.remove(messageHashHex) ?: return
+    private fun cancelPendingResource(message: LXMessage) {
+        val stale = pendingResources.remove(message) ?: return
 
-        stale.second.cancel()
+        stale.cancel()
     }
 
     // ===== Inbound Message Handling =====
@@ -3186,23 +3369,25 @@ class LXMRouter(
 
         stampGenMutex.withLock {
             // Pick first entry
-            val entry = pendingDeferredStamps.entries.firstOrNull() ?: return
-            val messageIdHex = entry.key
-            val message = entry.value
+            val message = pendingDeferredStamps.firstOrNull() ?: return
 
             try {
                 // Generate stamp
                 message.getStamp()
                 message.repackWithStamp()
 
-                // Move to outbound queue
-                pendingDeferredStamps.remove(messageIdHex)
-                pendingOutboundMutex.withLock {
+                // Move to outbound queue. Both steps under the queue lock, so a cancel in the
+                // meantime has either already taken the message out of the deferred set, in
+                // which case it is not queued, or finds it queued afterwards.
+                val moved = pendingOutboundMutex.withLock {
+                    if (!pendingDeferredStamps.remove(message)) return@withLock false
+
                     pendingOutbound.add(message)
                 }
-                triggerProcessing()
+
+                if (moved) triggerProcessing()
             } catch (e: Exception) {
-                RnsLog.error("LXMRouter") { "Error generating deferred stamp for $messageIdHex: ${e.message}" }
+                RnsLog.error("LXMRouter") { "Error generating deferred stamp for ${message.hash?.toHexString()}: ${e.message}" }
                 // Leave in deferred queue for retry
             }
         }

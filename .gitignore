@@ -33,3 +33,4 @@ local.properties
 .claude/
 .claude-flow/
 .mcp.json
+.kotlin/
