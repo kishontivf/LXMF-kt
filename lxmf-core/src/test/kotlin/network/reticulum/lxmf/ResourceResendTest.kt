@@ -187,21 +187,20 @@ class ResourceResendTest {
 
     /**
      * Queues [message] to a destination with an active direct link and drives the router until
-     * a Resource is in flight for it, then returns the message's hash and that Resource.
+     * a Resource is in flight for it, then returns that Resource.
      *
      * Driving is by hand: handleOutbound also launches a pass of its own, and whichever loses the
      * race for the processing mutex does nothing, so the loop polls until one of them got there.
      * It waits for the Resource rather than for SENDING, which sendViaLink sets before the
      * Resource exists.
      */
-    private suspend fun sendAsResource(message: LXMessage, dest: Destination): Pair<String, Resource> {
+    private suspend fun sendAsResource(message: LXMessage, dest: Destination): Resource {
         router.setDirectLinkForTest(dest.hash.toHexString(), activeLinkTo(dest))
         router.handleOutbound(message)
 
-        val hashHex = message.hash!!.toHexString()
-        driveUntil { router.pendingResourceForTest(hashHex) != null }
+        driveUntil { router.pendingResourceForTest(message) != null }
 
-        return hashHex to assertNotNull(router.pendingResourceForTest(hashHex))
+        return assertNotNull(router.pendingResourceForTest(message))
     }
 
     /** Backdates the message's last send so the next pass sees a stalled transfer. */
@@ -222,13 +221,13 @@ class ResourceResendTest {
     fun `a resend cancels the message's previous Resource`() = runBlocking {
         val dest = deliveryDestination(Identity.create())
         val message = resourceMessageTo(dest)
-        val (hashHex, first) = sendAsResource(message, dest)
+        val first = sendAsResource(message, dest)
         assertEquals(ResourceConstants.ADVERTISED, first.status)
 
         stall(message)
-        driveUntil { router.pendingResourceForTest(hashHex) !== first }
+        driveUntil { router.pendingResourceForTest(message) !== first }
 
-        val second = assertNotNull(router.pendingResourceForTest(hashHex))
+        val second = assertNotNull(router.pendingResourceForTest(message))
         assertEquals(ResourceConstants.FAILED, first.status, "the replaced Resource is cancelled")
         // Cancelling freed the link, so the new Resource advertised at once rather than parking
         // in QUEUED behind the old one with a polling thread of its own.
@@ -244,11 +243,11 @@ class ResourceResendTest {
         val deliveries = AtomicInteger()
         message.failedCallback = { failures.incrementAndGet() }
         message.deliveryCallback = { deliveries.incrementAndGet() }
-        val (hashHex, first) = sendAsResource(message, dest)
+        val first = sendAsResource(message, dest)
 
         stall(message)
-        driveUntil { router.pendingResourceForTest(hashHex) !== first }
-        val second = router.pendingResourceForTest(hashHex)
+        driveUntil { router.pendingResourceForTest(message) !== first }
+        val second = router.pendingResourceForTest(message)
         val sentAt = message.nextDeliveryAttempt
 
         // Cancelling `first` fired its failed callback during the resend. That used to put the
@@ -264,14 +263,14 @@ class ResourceResendTest {
         assertEquals(0, deliveries.get(), "a replaced Resource's completion must not deliver")
         assertEquals(MessageState.SENDING, message.state)
         assertEquals(sentAt, message.nextDeliveryAttempt)
-        assertSame(second, router.pendingResourceForTest(hashHex))
+        assertSame(second, router.pendingResourceForTest(message))
     }
 
     @Test
     fun `the stall rule resends once per SENDING_STALL_TIMEOUT, not on every pass`() = runBlocking {
         val dest = deliveryDestination(Identity.create())
         val message = resourceMessageTo(dest)
-        val (hashHex, first) = sendAsResource(message, dest)
+        val first = sendAsResource(message, dest)
 
         // The first send sets the clock the stall rule reads. It used to leave it unset, so the
         // rule fired on the first pass after a send and then on every pass after that.
@@ -279,8 +278,8 @@ class ResourceResendTest {
         assertTrue(System.currentTimeMillis() - sentAt < 5_000, "the send time is now, not a past failure's")
 
         stall(message)
-        driveUntil { router.pendingResourceForTest(hashHex) !== first }
-        val second = router.pendingResourceForTest(hashHex)
+        driveUntil { router.pendingResourceForTest(message) !== first }
+        val second = router.pendingResourceForTest(message)
         assertEquals(1, message.deliveryAttempts)
 
         // Further passes see a send made moments ago and leave it alone.
@@ -289,7 +288,7 @@ class ResourceResendTest {
             delay(20)
         }
 
-        assertSame(second, router.pendingResourceForTest(hashHex))
+        assertSame(second, router.pendingResourceForTest(message))
         assertEquals(1, message.deliveryAttempts)
         assertEquals(MessageState.SENDING, message.state)
     }
@@ -300,17 +299,17 @@ class ResourceResendTest {
         val message = resourceMessageTo(dest)
         val failures = AtomicInteger()
         message.failedCallback = { failures.incrementAndGet() }
-        val (hashHex, _) = sendAsResource(message, dest)
+        sendAsResource(message, dest)
 
         repeat(LXMRouter.MAX_DELIVERY_ATTEMPTS) {
-            val current = router.pendingResourceForTest(hashHex)
+            val current = router.pendingResourceForTest(message)
             stall(message)
-            driveUntil { router.pendingResourceForTest(hashHex) !== current }
+            driveUntil { router.pendingResourceForTest(message) !== current }
         }
 
         // Eight unanswered sends: the route is written off and the message parked, as it is for
         // a link that never answers — not sent a ninth time. Its last Resource is cancelled too.
-        assertNull(router.pendingResourceForTest(hashHex), "the stalled Resource is cancelled on parking")
+        assertNull(router.pendingResourceForTest(message), "the stalled Resource is cancelled on parking")
         assertEquals(MessageState.OUTBOUND, message.state)
         assertEquals(0, message.deliveryAttempts, "parking hands the attempts back")
         assertEquals(0, failures.get(), "only MAX_OUTBOUND_AGE may fail a message")
@@ -326,7 +325,7 @@ class ResourceResendTest {
             delay(20)
         }
 
-        assertNull(router.pendingResourceForTest(hashHex))
+        assertNull(router.pendingResourceForTest(message))
         assertEquals(MessageState.OUTBOUND, message.state)
     }
 
@@ -349,7 +348,7 @@ class ResourceResendTest {
         // iPhone's, would ignore a Resource without a word.
         assertNotNull(router.directLinkForTest(senderHex), "the reply opens a link of its own")
         assertTrue(theirLink.readyForNewResource(), "nothing is advertised on the unidentified link")
-        assertNull(router.pendingResourceForTest(reply.hash!!.toHexString()))
+        assertNull(router.pendingResourceForTest(reply))
         assertEquals(MessageState.OUTBOUND, reply.state)
     }
 
@@ -364,12 +363,11 @@ class ResourceResendTest {
         val reply = resourceMessageTo(senderDelivery)
 
         router.handleOutbound(reply)
-        val replyHex = reply.hash!!.toHexString()
-        driveUntil { router.pendingResourceForTest(replyHex) != null || router.directLinkForTest(senderHex) != null }
+        driveUntil { router.pendingResourceForTest(reply) != null || router.directLinkForTest(senderHex) != null }
 
         // Python's delivery_remote_identified: the identified link is the backchannel, and the
         // DIRECT branch takes it for any representation before opening a link of its own.
-        assertNotNull(router.pendingResourceForTest(replyHex), "the reply goes as a Resource over the backchannel")
+        assertNotNull(router.pendingResourceForTest(reply), "the reply goes as a Resource over the backchannel")
         assertFalse(theirLink.readyForNewResource(), "the Resource is advertised on the identified link")
         assertNull(router.directLinkForTest(senderHex), "no link of its own is opened")
         assertEquals(MessageState.SENDING, reply.state)

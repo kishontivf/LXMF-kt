@@ -74,3 +74,73 @@ The re-request is therefore relocated to the `closedCallback`, where kotlin actu
 This matters specifically for transport-enabled nodes: reticulum-kt's `Transport.deregisterLink` stale-path recovery (expire + re-request on pending-link timeout) is intentionally gated to non-transport nodes (Python `Transport.py:504` parity), so for transport-mode users the LXMF close-time re-request is the only mechanism that refreshes a stale path after a failed DIRECT link.
 
 **Re-evaluation:** If the kotlin `LXMRouter` ever stops eagerly removing the link in `closedCallback` and instead lets `processDirectDelivery` observe and pop CLOSED links (matching Python's `direct_links` lifecycle), move the re-request back into the CLOSED branch and delete this deviation. The per-message `pathRequestRetried` semantics would then align 1:1 with Python without the close-event approximation.
+
+### Outbound state keyed by the queued instance, and `cancelOutbound(message)` — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMRouter.kt::pendingResources`, `::pathlessBackoffSteps`, `::awaitingFreshPath`, `::pendingDeferredStamps`, `::cancelOutbound`
+
+**Python reference:** `LXMF/LXMF/LXMRouter.py::cancel_outbound(message_id)` and `pending_deferred_stamps`, both keyed by message id. Python tracks a message's resource on the message object itself (`LXMessage.resource_representation`).
+
+**Category:** new feature
+
+**Date:** 2026-10-08
+
+**Tracking:** Analog FEATURE-25, milestone 1, step 0.
+
+**Description:** A caller may queue one message twice under one hash: once direct or opportunistic, and once more as `PROPAGATED` when no proof came back in time. Everything the router keeps per message is therefore keyed by the queued `LXMessage` instance, never by its hash, so the two instances have their own Resource, their own route retry state and their own deferred stamp entry. `cancelOutbound(message: LXMessage): Boolean` cancels that one instance and returns whether it was still queued. It holds `outboundProcessingMutex` and `pendingOutboundMutex`, so no dispatch pass overlaps it. A receipt timeout and a Resource failure put a message back only while it is still queued (`retryAfterUnproven` checks that under the queue lock), and a closed link, the stall rule and the unproven-packet resend only ever look at queued instances. The one callback that still fires after a cancel is `deliveryCallback` from a proof of a packet already in flight, by the developer's decision. Python's `cancel_outbound` is keyed by message id and would cancel both instances.
+
+**Re-evaluation:** None needed. If python ever gains a per-instance cancel, align the name.
+
+### Outbound age counted from hand-over — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMRouter.kt::hasOutlivedTheQueue`, `LXMessage.handedOverAt`
+
+**Python reference:** `LXMF/LXMF/LXMRouter.py::process_outbound` fails a message on `MAX_DELIVERY_ATTEMPTS`; it has no age bound.
+
+**Category:** new feature
+
+**Date:** 2026-10-08
+
+**Tracking:** Analog FEATURE-25, milestone 1, step 0.
+
+**Description:** This fork's only terminal bound, `MAX_OUTBOUND_AGE`, used to be measured from the message's timestamp. It is now measured from `LXMessage.handedOverAt`, which `handleOutbound` sets. A caller that keeps a message over a restart hands it over again with its original timestamp, so the hash is unchanged, and the message gets a fresh day instead of being failed on sight. The timestamp and the hash are not touched.
+
+**Re-evaluation:** None needed; python has no age bound to align with.
+
+### Propagation stamp made off the processing lock — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMRouter.kt::processPropagatedDelivery`, `::sendViaPropagation`, `::packForPropagation`
+
+**Python reference:** `LXMF/LXMF/LXMessage.py::pack` (lines 434-441) makes the propagation stamp when the message is packed, on the caller's thread in `handle_outbound`; `process_outbound` only hands the packed bytes to a `Resource`.
+
+**Category:** language/runtime forced
+
+**Date:** 2026-10-08
+
+**Tracking:** Analog FEATURE-25, milestone 1, step 0.
+
+**Description:** `LXMessage.pack()` here is synchronous and the stamp is a suspending proof of work, so this port makes the stamp at send time. It used to do that inside `sendViaPropagation` with `runBlocking` while `outboundProcessingMutex` was held, which stopped every other send for the seconds a stamp takes on a phone. `processPropagatedDelivery` now sets the message `SENDING` and launches `sendViaPropagation` on `processingScope`; the stamp is made there under `stampGenMutex`, outside the processing lock. The Resource gets its callbacks and its `pendingResources` entry before it advertises, under the queue lock and only while the instance is still queued and `SENDING`, so a failure in that gap is not lost and a cancel during the stamp drops the upload unsent. The wire format is unchanged.
+
+**Re-evaluation:** If `LXMessage.pack()` ever becomes suspending and makes the propagation stamp as python does, delete `packForPropagation` and this entry.
+
+### `@Volatile` on `LXMessage.state` — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMessage.kt::state`
+
+**Python reference:** `LXMF/LXMF/LXMessage.py` (`self.state`), written from the router loop, receipt callbacks and resource callbacks under the GIL.
+
+**Category:** language/runtime forced
+
+**Date:** 2026-10-08
+
+**Tracking:** Analog FEATURE-25, milestone 1, step 0.
+
+**Description:** The same reason as `progress` above. `state` is written by processing coroutines, receipt callbacks, Resource callbacks and now `cancelOutbound` from the caller's coroutine, and read by callers on other threads. `@Volatile` gives each read the latest write, which the GIL gives python for free.
+
+**Re-evaluation:** As for `progress`.
+
+### Stamped payload hashed over the received bytes — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMessage.kt::unpackFromBytes`, `::hashedPayload`
+
+**Python reference:** `LXMF/LXMF/LXMessage.py::unpack_from_bytes` (lines 742-747). When the payload has a fifth element, python takes the first four elements, packs them again with msgpack, and hashes that.
+
+**Category:** language/runtime forced
+
+**Date:** 2026-10-08
+
+**Tracking:** Analog FEATURE-25, milestone 2, step 2.
+
+**Description:** This port used to decode the payload and encode the first four elements again, as python does. Python's round trip through msgpack gives back the bytes it was given for everything python itself writes. The JVM round trip does not. `fields` is a `Map<Int, Any>`, so a field with a nil value was dropped and the map shrank. msgpack-java decodes a float32 as a double, and the port encoded it as a float64. Either changes the bytes. The hash then no longer matches the one the sender signed, and a genuine signature fails to verify. `unpackFromBytes` now takes the received bytes, replaces the array header with a four-element header, and cuts everything from the stamp element on. That is the four elements exactly as the sender encoded them, which is what the sender hashed. A fields element that is msgpack nil is kept as the nil byte, which the old code reproduced by hand. A message python produced hashes to the same value as before, because python's packer writes the same element bytes with and without the stamp. LXMF-swift does the same in `hashedPayloadBytes` (commit `5605dd6`). One difference from python stays on purpose. A stamped message with a float32 field verifies here and in LXMF-swift. In python it fails, because python packs the float again as a float64. iOS writes its fields map in a random key order. A map decoded here keeps the wire order, so that case verified before too. `StampedPayloadHashTest` now pins it.
+
+**Re-evaluation:** None needed. If python ever hashes the received bytes instead of packing them again, the two match exactly and this entry can go.

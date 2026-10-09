@@ -66,8 +66,14 @@ class LXMessage private constructor(
 
     // ===== State and Flags =====
 
-    /** Current message state */
-    var state: MessageState = MessageState.GENERATING
+    /**
+     * Current message state.
+     *
+     * `@Volatile` because it is written from several threads: the router's processing
+     * coroutines, packet receipt callbacks, Resource callbacks, and [LXMRouter.cancelOutbound]
+     * from the caller's own coroutine. See `port-deviations.md`.
+     */
+    @Volatile var state: MessageState = MessageState.GENERATING
 
     /** Message representation (PACKET or RESOURCE) */
     var representation: MessageRepresentation = MessageRepresentation.UNKNOWN
@@ -175,6 +181,15 @@ class LXMessage private constructor(
 
     /** Next delivery attempt timestamp (milliseconds) */
     var nextDeliveryAttempt: Long? = null
+
+    /**
+     * When [LXMRouter.handleOutbound] last took this message, in epoch milliseconds.
+     *
+     * Null until then. The router's age limit counts from this moment, not from [timestamp], so
+     * a message handed over again after a restart keeps its timestamp and its hash and still gets
+     * a fresh limit. Not part of the wire format.
+     */
+    var handedOverAt: Long? = null
 
     /**
      * Whether a path re-request has already been issued for a CLOSED delivery
@@ -715,6 +730,10 @@ class LXMessage private constructor(
                 val unpacker = MessagePack.newDefaultUnpacker(packedPayload)
                 val arraySize = unpacker.unpackArrayHeader()
 
+                // Where the first element starts, so hashedPayload can keep the elements as
+                // received and only replace the array header.
+                val firstElement = unpacker.totalReadBytes.toInt()
+
                 if (arraySize < 4) {
                     RnsLog.warn("LXMessage") { "Invalid LXMF payload: expected at least 4 elements, got $arraySize" }
                     return null
@@ -736,17 +755,18 @@ class LXMessage private constructor(
                 // [3] fields — may be msgpack Nil (interop: other LXMF implementations and
                 // python's `set_fields(None)` both produce Nil here; python tolerates this on
                 // unpack via LXMessage.py:755 + set_fields() at LXMessage.py:220-224
-                // which accepts None and normalizes to {}). Track wire encoding so
-                // we can repack identically when a stamp is present.
+                // which accepts None and normalizes to {}).
                 // tryUnpackNil() peek-and-consumes in one call; if it returns true the
                 // Nil byte is already consumed so no follow-up unpackNil() is needed.
-                val fieldsWasNil = unpacker.tryUnpackNil()
                 val fields =
-                    if (fieldsWasNil) {
+                    if (unpacker.tryUnpackNil()) {
                         mutableMapOf()
                     } else {
                         unpackFields(unpacker)
                     }
+
+                // Where the stamp starts, so hashedPayload can cut it out of the received bytes.
+                val stampElement = unpacker.totalReadBytes.toInt()
 
                 // [4] stamp (optional)
                 val stamp: ByteArray? =
@@ -761,16 +781,15 @@ class LXMessage private constructor(
 
                 unpacker.close()
 
-                // Mirror python LXMessage.py:742-747: only re-pack to strip the stamp.
-                // For stampless messages use the original packedPayload bytes directly —
-                // any msgpack encoding round-trip risks a hash mismatch (e.g. empty fields
-                // encoded as Nil 0xc0 vs empty Map 0x80). With a stamp present, repack
-                // preserving the original fields encoding (Nil if it was Nil on the wire).
+                // Python (LXMessage.py:742-747) decodes the payload and packs the first four
+                // elements again to strip the stamp. On the JVM that round trip changes the
+                // bytes, so this port cuts the stamp out of the received bytes instead. See
+                // hashedPayload, and port-deviations.md.
                 val payloadWithoutStamp =
                     if (stamp == null) {
                         packedPayload
                     } else {
-                        repackPayload(timestamp, titleBytes, contentBytes, fields, fieldsWasNil)
+                        hashedPayload(packedPayload, firstElement, stampElement)
                     }
 
                 // Build hashed part
@@ -919,100 +938,25 @@ class LXMessage private constructor(
         }
 
         /**
-         * Repack payload without stamp for hash verification.
+         * Returns the payload bytes the sender hashed: the received bytes with the stamp cut out.
          *
-         * [fieldsWasNil] preserves the original wire encoding for the fields
-         * position. If the inbound payload encoded fields as msgpack Nil
-         * (`0xc0`, what other LXMF implementations and python's `msgpack.packb(None)` produce),
-         * we must emit Nil here too — emitting an empty Map (`0x80`) instead
-         * would change the byte representation and break the message hash.
-         * Mirrors python `msgpack.packb(unpacked_payload)` round-trip
-         * behavior at LXMessage.py:745, which preserves None as Nil.
+         * The sender hashed a four-element array, then sent the same elements with the stamp as
+         * a fifth. So the hashed bytes are a four-element header, then the received bytes of the
+         * first four elements, exactly as the sender encoded them. Decoding those elements and
+         * encoding them again is not the same thing. A nil value is dropped, and a float32
+         * becomes a float64. The hash would then differ from the one the sender signed, and a
+         * genuine signature would fail to verify. LXMF-swift cuts the bytes the same way in
+         * `hashedPayloadBytes`.
+         *
+         * @param packedPayload the received payload, stamp included.
+         * @param firstElement offset of the first element, just after the array header.
+         * @param stampElement offset of the stamp element. Everything from here on is cut.
+         * @return the four-element payload the sender hashed.
          */
-        private fun repackPayload(
-            timestamp: Double,
-            titleBytes: ByteArray,
-            contentBytes: ByteArray,
-            fields: Map<Int, Any>,
-            fieldsWasNil: Boolean = false,
-        ): ByteArray {
-            val buffer = ByteArrayOutputStream()
-            val packer = MessagePack.newDefaultPacker(buffer)
+        private fun hashedPayload(packedPayload: ByteArray, firstElement: Int, stampElement: Int): ByteArray =
+            byteArrayOf(FOUR_ELEMENT_ARRAY) + packedPayload.copyOfRange(firstElement, stampElement)
 
-            // Pack as 4-element list (without stamp)
-            packer.packArrayHeader(4)
-
-            // [0] timestamp
-            packer.packDouble(timestamp)
-
-            // [1] title
-            packer.packBinaryHeader(titleBytes.size)
-            packer.writePayload(titleBytes)
-
-            // [2] content
-            packer.packBinaryHeader(contentBytes.size)
-            packer.writePayload(contentBytes)
-
-            // [3] fields — emit Nil if that's what the wire had, else Map
-            if (fieldsWasNil && fields.isEmpty()) {
-                packer.packNil()
-            } else {
-                packer.packMapHeader(fields.size)
-                for ((key, value) in fields) {
-                    packer.packInt(key)
-                    repackValue(packer, value)
-                }
-            }
-
-            packer.close()
-            return buffer.toByteArray()
-        }
-
-        /**
-         * Repack a value for hash verification.
-         */
-        private fun repackValue(
-            packer: org.msgpack.core.MessagePacker,
-            value: Any,
-        ) {
-            when (value) {
-                is ByteArray -> {
-                    packer.packBinaryHeader(value.size)
-                    packer.writePayload(value)
-                }
-                is String -> packer.packString(value)
-                is Int -> packer.packInt(value)
-                is Long -> packer.packLong(value)
-                is Double -> packer.packDouble(value)
-                is Float -> packer.packFloat(value)
-                is Boolean -> packer.packBoolean(value)
-                is List<*> -> {
-                    packer.packArrayHeader(value.size)
-                    for (item in value) {
-                        if (item != null) {
-                            repackValue(packer, item)
-                        } else {
-                            packer.packNil()
-                        }
-                    }
-                }
-                is Map<*, *> -> {
-                    packer.packMapHeader(value.size)
-                    for ((k, v) in value) {
-                        if (k != null) {
-                            repackValue(packer, k)
-                        } else {
-                            packer.packNil()
-                        }
-                        if (v != null) {
-                            repackValue(packer, v)
-                        } else {
-                            packer.packNil()
-                        }
-                    }
-                }
-                else -> packer.packString(value.toString())
-            }
-        }
+        /** Msgpack fixarray header for four elements, which every payload without a stamp starts with. */
+        private const val FOUR_ELEMENT_ARRAY: Byte = 0x94.toByte()
     }
 }
