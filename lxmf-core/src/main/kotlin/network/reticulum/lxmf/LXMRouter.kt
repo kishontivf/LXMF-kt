@@ -18,6 +18,7 @@ import network.reticulum.link.LinkConstants
 import network.reticulum.packet.Packet
 import network.reticulum.resource.Resource
 import network.reticulum.resource.ResourceAdvertisement
+import network.reticulum.resource.ResourceConstants
 import network.reticulum.transport.AnnounceHandler
 import network.reticulum.transport.Transport
 import org.msgpack.core.MessagePack
@@ -153,14 +154,16 @@ class LXMRouter(
         const val UNPROVEN_ROUTE_RETRY_WAIT = 300000L
 
         /**
-         * How long a resource transfer may sit in [MessageState.SENDING] before it is sent again.
+         * How long a resource transfer may go without a sign of life before it is sent again.
          *
-         * Long enough not to interrupt a slow but working transfer — an image-sized payload can
-         * take tens of seconds over a constrained carrier — and short enough that a transfer whose
-         * link died is not simply lost.
+         * Measured from the Resource's own last activity: its advertisement, or a part or a
+         * hashmap update going out. Time a Resource spends waiting behind another transfer on
+         * the link does not count. So a working transfer is never interrupted, however slow. A
+         * photo over Bluetooth takes minutes at a kilobyte a second. And a transfer whose link
+         * died is not simply lost.
          *
-         * Measured from the latest send: every Resource send sets `nextDeliveryAttempt` to the
-         * moment it was made, so the rule fires once per stall and not on every pass after it.
+         * It used to be measured from the send, which cut every transfer longer than this while
+         * it was still moving. See [isStalled].
          */
         internal const val SENDING_STALL_TIMEOUT = 120000L
 
@@ -288,7 +291,8 @@ class LXMRouter(
      * One live Resource per queued instance. A send cancels the Resource it replaces before
      * starting a new one, and a Resource's callbacks act only while it is still the instance's
      * entry here. Keyed by the instance rather than by hash so that a message's direct send and
-     * its upload to a propagation node, which share a hash, each keep their own transfer.
+     * its upload to a propagation node, which share a hash, each keep their own transfer. The
+     * stall rule reads each Resource's own status and last activity.
      */
     private val pendingResources = ConcurrentHashMap<LXMessage, Resource>()
 
@@ -899,19 +903,21 @@ class LXMRouter(
                             // callbacks, so a link that dies without either leaves the message
                             // here with nothing to move it: not OUTBOUND, so never dispatched, and
                             // not terminal, so never removed. The symptom is an entry sitting in
-                            // SENDING well past its due time with nothing ever looking at it.
+                            // SENDING with nothing ever looking at it.
                             //
-                            // The bound is deliberately generous. A real transfer takes as long as
-                            // the carrier needs, and tens of kilobytes over a constrained one takes
-                            // tens of seconds — so this is a wedge-breaker, not an opinion about
-                            // how fast a resource ought to be.
-                            if (currentTime - (message.nextDeliveryAttempt ?: currentTime) > SENDING_STALL_TIMEOUT) {
+                            // The bound is on inactivity, not on age. A real transfer takes as
+                            // long as the carrier needs — a photo over Bluetooth takes minutes at
+                            // a kilobyte a second — so this is a wedge-breaker, not an opinion
+                            // about how fast a resource ought to be. It used to measure from the
+                            // send, and cut every transfer longer than the timeout while it was
+                            // still moving.
+                            if (isStalled(message, currentTime)) {
                                 RnsLog.warn("LXMRouter") { "A resource to ${message.destinationHash.toHexString()} stalled; sending it again" }
 
                                 // A stall resend is a delivery attempt like any other. Counting
                                 // it means a peer that never answers a Resource parks the message
                                 // at MAX_DELIVERY_ATTEMPTS instead of being sent to for as long
-                                // as the link lives. The send itself moves nextDeliveryAttempt,
+                                // as the link lives. The new Resource starts a clock of its own,
                                 // so this fires once per stall rather than on every pass.
                                 message.deliveryAttempts++
                                 message.state = MessageState.OUTBOUND
@@ -1013,6 +1019,16 @@ class LXMRouter(
     /** Test seam: the Resource in flight for a queued instance, if any. */
     @org.jetbrains.annotations.VisibleForTesting
     internal fun pendingResourceForTest(message: LXMessage): Resource? = pendingResources[message]
+
+    /**
+     * Test seam: moves the last activity of the Resource in flight for [message] [by]
+     * milliseconds into the past, so a test need not wait for a stall. Does nothing when no
+     * Resource is in flight.
+     */
+    @org.jetbrains.annotations.VisibleForTesting
+    internal fun ageTransferForTest(message: LXMessage, by: Long) {
+        pendingResources[message]?.backdateActivityForTest(by)
+    }
 
     /**
      * Process a single outbound message based on its delivery method.
@@ -2143,7 +2159,7 @@ class LXMRouter(
                 }
 
                 // Track the resource before it is advertised, so a callback can never find the
-                // entry missing. The stall rule measures from this moment.
+                // entry missing. The stall rule reads the Resource's own activity clock.
                 pendingResources[message] = resource
                 message.state = MessageState.SENDING
                 message.nextDeliveryAttempt = System.currentTimeMillis()
@@ -2177,6 +2193,30 @@ class LXMRouter(
         val stale = pendingResources.remove(message) ?: return
 
         stale.cancel()
+    }
+
+    /**
+     * Tells whether the transfer for the queued instance [message] has stalled.
+     *
+     * A transfer has stalled when its Resource has shown no activity for [SENDING_STALL_TIMEOUT].
+     * The check reads `Resource.lastActivityAt`, the clock the Resource's own watchdog measures
+     * idle time from. It moves when the Resource advertises, and whenever a part or a hashmap
+     * update goes out. So a transfer that is still moving never stalls, however slow it is. A
+     * Resource still waiting its turn behind another transfer on the link is never stalled: its
+     * clock moves when the link takes it. A message in SENDING with no Resource yet is a node
+     * upload still making its stamp. That one is measured from the moment it was set SENDING,
+     * which [processPropagatedDelivery] records in `nextDeliveryAttempt`.
+     *
+     * @param message a queued instance in [MessageState.SENDING].
+     * @param now the current time, in epoch milliseconds.
+     * @return true when the transfer should be cancelled and the message sent again.
+     */
+    private fun isStalled(message: LXMessage, now: Long): Boolean {
+        val resource = pendingResources[message]
+            ?: return now - (message.nextDeliveryAttempt ?: now) > SENDING_STALL_TIMEOUT
+
+        return resource.status != ResourceConstants.QUEUED &&
+                now - resource.lastActivityAt > SENDING_STALL_TIMEOUT
     }
 
     // ===== Inbound Message Handling =====

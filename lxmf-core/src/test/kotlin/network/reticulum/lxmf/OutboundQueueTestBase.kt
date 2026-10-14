@@ -134,9 +134,13 @@ abstract class OutboundQueueTestBase {
         return assertNotNull(router.pendingResourceForTest(message))
     }
 
-    /** Backdates the message's last send so the next pass sees a stalled transfer. */
+    /**
+     * Backdates the Resource's activity clock so the next pass sees a stalled transfer. Also
+     * backdates the send, which is what the rule reads for a node upload with no Resource yet.
+     */
     protected fun stall(message: LXMessage) {
         message.nextDeliveryAttempt = System.currentTimeMillis() - LXMRouter.SENDING_STALL_TIMEOUT - 1
+        router.ageTransferForTest(message, LXMRouter.SENDING_STALL_TIMEOUT + 1)
     }
 
     protected suspend fun driveUntil(condition: () -> Boolean) {

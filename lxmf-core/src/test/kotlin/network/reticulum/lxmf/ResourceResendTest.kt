@@ -203,9 +203,10 @@ class ResourceResendTest {
         return assertNotNull(router.pendingResourceForTest(message))
     }
 
-    /** Backdates the message's last send so the next pass sees a stalled transfer. */
+    /** Backdates the Resource's activity clock, and the send, so the next pass sees a stalled transfer. */
     private fun stall(message: LXMessage) {
         message.nextDeliveryAttempt = System.currentTimeMillis() - LXMRouter.SENDING_STALL_TIMEOUT - 1
+        router.ageTransferForTest(message, LXMRouter.SENDING_STALL_TIMEOUT + 1)
     }
 
     private suspend fun driveUntil(condition: () -> Boolean) {

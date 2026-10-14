@@ -144,3 +144,21 @@ This matters specifically for transport-enabled nodes: reticulum-kt's `Transport
 **Description:** This port used to decode the payload and encode the first four elements again, as python does. Python's round trip through msgpack gives back the bytes it was given for everything python itself writes. The JVM round trip does not. `fields` is a `Map<Int, Any>`, so a field with a nil value was dropped and the map shrank. msgpack-java decodes a float32 as a double, and the port encoded it as a float64. Either changes the bytes. The hash then no longer matches the one the sender signed, and a genuine signature fails to verify. `unpackFromBytes` now takes the received bytes, replaces the array header with a four-element header, and cuts everything from the stamp element on. That is the four elements exactly as the sender encoded them, which is what the sender hashed. A fields element that is msgpack nil is kept as the nil byte, which the old code reproduced by hand. A message python produced hashes to the same value as before, because python's packer writes the same element bytes with and without the stamp. LXMF-swift does the same in `hashedPayloadBytes` (commit `5605dd6`). One difference from python stays on purpose. A stamped message with a float32 field verifies here and in LXMF-swift. In python it fails, because python packs the float again as a float64. iOS writes its fields map in a random key order. A map decoded here keeps the wire order, so that case verified before too. `StampedPayloadHashTest` now pins it.
 
 **Re-evaluation:** None needed. If python ever hashes the received bytes instead of packing them again, the two match exactly and this entry can go.
+
+### The stall rule, measured by inactivity — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMRouter.kt::processOutbound` (SENDING branch), `::isStalled`
+
+**Python reference:** `LXMF/LXMF/LXMRouter.py::process_outbound`, DIRECT branch. A message in `SENDING` over an active link is left alone ("The transfer of ... is in progress"). `LXMF/LXMF/LXMessage.py::__resource_concluded`: a Resource that ends without `COMPLETE` tears its link down and puts the message back to `OUTBOUND`.
+
+**Category:** new feature
+
+**Date:** 2026-10-13
+
+**Tracking:** none. Seen in the Analog app on a Pixel 8 Pro sending to a Pixel 10 Pro over Bluetooth, 2026-10-13.
+
+**Description:** Python has no stall rule. A `SENDING` message is left to its Resource. The Resource's watchdog cancels it after `MAX_RETRIES` idle rounds, and the Resource callback puts the message back to `OUTBOUND`. This fork keeps a rule of its own in `processOutbound`, for a link that dies without any callback. A transfer that has stalled for `SENDING_STALL_TIMEOUT` (120 s) is cancelled and sent again. The resend is billed as a delivery attempt, so a peer that never answers parks the message at `MAX_DELIVERY_ATTEMPTS`.
+
+What "stalled" means changed on 2026-10-13. The rule used to measure from the send. `nextDeliveryAttempt` was set when the Resource was created, so a transfer longer than 120 s was cancelled while it was still moving. A Resource waiting behind another transfer on the same link had its wait counted too. Two photos of about 130 kB each, over Bluetooth at about a kilobyte a second, were restarted six times between them.
+
+The rule now measures from the Resource's own last activity, `Resource.lastActivityAt`, which reticulum-kt exposes from 0.2.3. That is the clock the Resource's watchdog measures idle time from. It moves when the Resource advertises, and whenever a part or a hashmap update goes out. A Resource in `QUEUED`, waiting its turn on the link, is never stalled. Its clock moves when the link takes it. A node upload still making its stamp has no Resource yet. It is measured from the moment it was set `SENDING`, as before.
+
+**Re-evaluation:** If the Resource watchdog's own cancel is trusted to reach the router in every case, the rule can go, and the port matches python here.
