@@ -213,6 +213,12 @@ class LXMRouter(
 
         /** LXMF propagation aspect */
         const val PROPAGATION_ASPECT = "propagation"
+
+        /**
+         * The fields a propagation announce must carry: the legacy flag, the timebase and the node
+         * state. Every later field is optional, as LXMF-swift reads an announce.
+         */
+        const val MIN_PROPAGATION_ANNOUNCE_FIELDS = 3
     }
 
     // ===== Message Queues =====
@@ -226,10 +232,6 @@ class LXMRouter(
     // reverse order is never acquired. Any new code that needs more than one
     // of these mutexes MUST follow this order, or restructure to take them
     // independently.
-
-    /** Pending inbound messages awaiting processing */
-    private val pendingInbound = mutableListOf<LXMessage>()
-    private val pendingInboundMutex = Mutex()
 
     /** Pending outbound messages awaiting delivery */
     private val pendingOutbound = mutableListOf<LXMessage>()
@@ -2791,6 +2793,12 @@ class LXMRouter(
      * Parses the announcement app data and stores the node information
      * for future use when sending PROPAGATED messages.
      *
+     * The app data is a msgpack array: `[legacy flag, timebase, node state, per-transfer limit,
+     * per-sync limit, stamp cost, metadata]`. Only the first three fields are required, as
+     * LXMF-swift's `PropagationNodeInfo.parse` reads it. A trailing field that is missing takes
+     * its default: no metadata means no name. Our own node announces six fields, without the
+     * metadata, and was refused for it before this.
+     *
      * @param destHash The destination hash of the propagation node
      * @param identity The identity of the propagation node
      * @param appData The announcement app data (msgpack-encoded)
@@ -2810,8 +2818,10 @@ class LXMRouter(
                     .newDefaultUnpacker(appData)
             val arraySize = unpacker.unpackArrayHeader()
 
-            if (arraySize < 7) {
-                RnsLog.warn("LXMRouter") { "Invalid propagation announce: expected 7 fields, got $arraySize" }
+            if (arraySize < MIN_PROPAGATION_ANNOUNCE_FIELDS) {
+                RnsLog.warn("LXMRouter") {
+                    "Invalid propagation announce: expected at least $MIN_PROPAGATION_ANNOUNCE_FIELDS fields, got $arraySize"
+                }
                 return
             }
 
@@ -2824,49 +2834,52 @@ class LXMRouter(
             // [2] Node state (bool - active propagation node)
             val isActive = if (!unpacker.tryUnpackNil()) unpacker.unpackBoolean() else true
 
-            // [3] Per-transfer limit (int KB) — some nodes send as float
+            // [3] Per-transfer limit (int KB) — some nodes send as float. Absent or nil takes the default.
             val perTransferLimit =
-                if (!unpacker.tryUnpackNil()) {
+                if (arraySize > 3 && !unpacker.tryUnpackNil()) {
                     unpackAsInt(unpacker)
                 } else {
                     LXMFConstants.PROPAGATION_LIMIT_KB
                 }
 
-            // [4] Per-sync limit (int KB) — some nodes send as float
+            // [4] Per-sync limit (int KB) — some nodes send as float. Absent or nil takes the default.
             val perSyncLimit =
-                if (!unpacker.tryUnpackNil()) {
+                if (arraySize > 4 && !unpacker.tryUnpackNil()) {
                     unpackAsInt(unpacker)
                 } else {
                     LXMFConstants.SYNC_LIMIT_KB
                 }
 
-            // [5] Stamp cost list [cost, flexibility, peering_cost]
+            // [5] Stamp cost: a list [cost, flexibility, peering_cost], or a single cost from an
+            // older node. Absent or nil takes the defaults.
             var stampCost = LXMFConstants.PROPAGATION_COST
             var stampCostFlex = LXMFConstants.PROPAGATION_COST_FLEX
             var peeringCost = LXMFConstants.PEERING_COST
 
-            if (!unpacker.tryUnpackNil()) {
-                val costArraySize = unpacker.unpackArrayHeader()
-                if (costArraySize >= 1) stampCost = unpackAsInt(unpacker)
-                if (costArraySize >= 2) stampCostFlex = unpackAsInt(unpacker)
-                if (costArraySize >= 3) peeringCost = unpackAsInt(unpacker)
+            if (arraySize > 5 && !unpacker.tryUnpackNil()) {
+                when (unpacker.nextFormat.valueType) {
+                    org.msgpack.value.ValueType.ARRAY -> {
+                        val costArraySize = unpacker.unpackArrayHeader()
+                        if (costArraySize >= 1) stampCost = unpackAsInt(unpacker)
+                        if (costArraySize >= 2) stampCostFlex = unpackAsInt(unpacker)
+                        if (costArraySize >= 3) peeringCost = unpackAsInt(unpacker)
+                        repeat(costArraySize - 3) { unpacker.skipValue() }
+                    }
+                    org.msgpack.value.ValueType.INTEGER,
+                    org.msgpack.value.ValueType.FLOAT,
+                    -> stampCost = unpackAsInt(unpacker)
+                    else -> unpacker.skipValue()
+                }
             }
 
-            // [6] Metadata (map with node name, etc.)
+            // [6] Metadata (map with node name, etc.). Absent or nil means no name.
             var displayName: String? = null
-            if (!unpacker.tryUnpackNil()) {
+            if (arraySize > 6 && !unpacker.tryUnpackNil()) {
                 val metaSize = unpacker.unpackMapHeader()
                 for (i in 0 until metaSize) {
                     val key = unpacker.unpackInt()
                     when (key) {
-                        LXMFConstants.PN_META_NAME -> {
-                            if (!unpacker.tryUnpackNil()) {
-                                val nameLen = unpacker.unpackBinaryHeader()
-                                val nameBytes = ByteArray(nameLen)
-                                unpacker.readPayload(nameBytes)
-                                displayName = String(nameBytes, Charsets.UTF_8)
-                            }
-                        }
+                        LXMFConstants.PN_META_NAME -> displayName = unpackName(unpacker)
                         else -> unpacker.skipValue()
                     }
                 }
@@ -4233,6 +4246,21 @@ class LXMRouter(
             else -> {
                 unpacker.skipValue()
                 0L
+            }
+        }
+
+    /** Unpack a propagation node's name, sent as bin or as str, as LXMF-swift reads it. Null for anything else. */
+    private fun unpackName(unpacker: org.msgpack.core.MessageUnpacker): String? =
+        when (unpacker.nextFormat.valueType) {
+            org.msgpack.value.ValueType.BINARY -> {
+                val nameBytes = ByteArray(unpacker.unpackBinaryHeader())
+                unpacker.readPayload(nameBytes)
+                String(nameBytes, Charsets.UTF_8)
+            }
+            org.msgpack.value.ValueType.STRING -> unpacker.unpackString()
+            else -> {
+                unpacker.skipValue()
+                null
             }
         }
 }
