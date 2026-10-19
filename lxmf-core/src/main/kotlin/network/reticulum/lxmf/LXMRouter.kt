@@ -28,6 +28,8 @@ import java.security.SecureRandom
 import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 import network.reticulum.common.RnsLog
+import kotlin.time.DurationUnit
+import kotlin.time.toDuration
 
 /**
  * LXMF Message Router.
@@ -179,32 +181,6 @@ class LXMRouter(
         /** A route reaching the peer with no node in between. See [hasBetterRouteThanLink]. */
         private const val DIRECT_ROUTE_HOPS = 1
 
-        /**
-         * The pause between a link reporting ACTIVE and the first packet down it.
-         *
-         * The far side arms its receive callback when its own link-established callback runs, and
-         * that is not synchronous with our proof validating.
-         */
-        private const val LINK_READY_GRACE = 100L
-
-        /** Message expiry time in milliseconds (30 days) */
-        const val MESSAGE_EXPIRY = 30L * 24 * 60 * 60 * 1000
-
-        /** Maximum messages in propagation transfer */
-        const val PROPAGATION_LIMIT = 256
-
-        /** Maximum messages in delivery transfer */
-        const val DELIVERY_LIMIT = 1000
-
-        /** Maximum peering connections */
-        const val MAX_PEERS = 20
-
-        /** Default propagation cost */
-        const val PROPAGATION_COST = 16
-
-        /** Strict message validation mode */
-        const val STRICT = false
-
         /** LXMF app name */
         const val APP_NAME = "lxmf"
 
@@ -219,6 +195,12 @@ class LXMRouter(
          * state. Every later field is optional, as LXMF-swift reads an announce.
          */
         const val MIN_PROPAGATION_ANNOUNCE_FIELDS = 3
+
+        /**
+         * How often a pull waiting for a path to the propagation node looks for it, in
+         * milliseconds. Python's `__request_messages_path_job` sleeps 0.1 s between looks.
+         */
+        const val PATH_POLL_INTERVAL = 100L
     }
 
     // ===== Message Queues =====
@@ -1001,6 +983,14 @@ class LXMRouter(
      */
     @org.jetbrains.annotations.VisibleForTesting
     internal var testHookBeforePropagationStamp: (suspend (LXMessage) -> Unit)? = null
+
+    /**
+     * How long a pull or a delivery waits for a path to the propagation node before giving the
+     * attempt up, in milliseconds. [PATH_REQUEST_WAIT] in production. A test shortens it, so a
+     * pull whose path never comes ends within the test.
+     */
+    @org.jetbrains.annotations.VisibleForTesting
+    internal var propagationPathWait: Long = PATH_REQUEST_WAIT
 
     /** Test seam: the current DIRECT delivery link for a destination, if any. */
     @org.jetbrains.annotations.VisibleForTesting
@@ -1907,6 +1897,17 @@ class LXMRouter(
                 val now = System.currentTimeMillis()
 
                 if (nextAttempt == 0L || now >= nextAttempt) {
+                    // Python's propagated branch asks for the path first and looks again after
+                    // PATH_REQUEST_WAIT. A link request without a path is broadcast on every
+                    // interface and never reaches a node behind a relay. Nothing was sent, so
+                    // the pass bills no attempt, as a pathless DIRECT pass bills none.
+                    if (!Transport.hasPath(node.destHash)) {
+                        Transport.requestPath(node.destHash)
+                        message.nextDeliveryAttempt = now + propagationPathWait
+                        RnsLog.debug("LXMRouter") { "No path to propagation node ${node.hexHash.take(12)}; requested one" }
+                        return
+                    }
+
                     message.deliveryAttempts++
                     message.nextDeliveryAttempt = now + DELIVERY_RETRY_WAIT
 
@@ -3017,6 +3018,10 @@ class LXMRouter(
      *
      * Progress can be tracked via propagationTransferProgress and
      * results via propagationTransferLastResult.
+     *
+     * A node without a path is asked for one first, and the link follows once the path is
+     * there: see [linkOncePathArrives]. A link request without a path is broadcast on every
+     * interface and never reaches a node behind a relay, so the pull would only time out.
      */
     fun requestMessagesFromPropagationNode() {
         val node = getActivePropagationNode()
@@ -3032,7 +3037,6 @@ class LXMRouter(
             return
         }
 
-        propagationTransferState = PropagationTransferState.LINK_ESTABLISHING
         propagationTransferProgress = 0.0
         propagationTransferLastResult = 0
 
@@ -3049,11 +3053,42 @@ class LXMRouter(
             // ERROR_NO_IDENTITY (240) on /get requests.
             identifyOnLink(link)
             requestMessageList(link)
-        } else {
-            // Need to establish link first
+        } else if (Transport.hasPath(node.destHash)) {
+            propagationTransferState = PropagationTransferState.LINK_ESTABLISHING
             establishPropagationLink(node)
+        } else {
+            // Python's request_messages_from_propagation_node: PR_PATH_REQUESTED, a path request,
+            // and request_messages_path_job to link once the path arrives.
+            propagationTransferState = PropagationTransferState.PATH_REQUESTED
+            Transport.requestPath(node.destHash)
+            RnsLog.debug("LXMRouter") { "requestMessages: no path to ${node.hexHash.take(12)}; requested one" }
+            processingScope.launch { linkOncePathArrives(node) }
         }
         RnsLog.debug("LXMRouter") { "requestMessages: returning, state=$propagationTransferState" }
+    }
+
+    /**
+     * Establishes the retrieval link to [node] once a path to it is there, or gives the pull up.
+     *
+     * Looks for the path every [PATH_POLL_INTERVAL] for up to [propagationPathWait]. Without a
+     * path in time the pull ends [PropagationTransferState.NO_PATH], and the next cycle asks
+     * again. Python's `__request_messages_path_job`.
+     */
+    private suspend fun linkOncePathArrives(node: PropagationNode) {
+        val deadline = System.currentTimeMillis() + propagationPathWait
+
+        while (!Transport.hasPath(node.destHash) && System.currentTimeMillis() < deadline) {
+            delay(PATH_POLL_INTERVAL.toDuration(DurationUnit.MILLISECONDS))
+        }
+
+        if (!Transport.hasPath(node.destHash)) {
+            RnsLog.debug("LXMRouter") { "requestMessages: no path to ${node.hexHash.take(12)} within $propagationPathWait ms" }
+            propagationTransferState = PropagationTransferState.NO_PATH
+            return
+        }
+
+        propagationTransferState = PropagationTransferState.LINK_ESTABLISHING
+        establishPropagationLink(node)
     }
 
     /**
