@@ -313,6 +313,16 @@ class LXMRouter(
     /** Maximum incoming message size in KB. Null = unlimited. */
     var incomingMessageSizeLimitKb: Int? = null
 
+    /**
+     * Decides whether an inbound message is delivered. Null delivers every message.
+     *
+     * Asked after the message is unpacked and its signature checked, and before the duplicate
+     * check, the delivery and the proof. A refused message is not proven, not delivered and not
+     * remembered. See [DeliveryPolicy].
+     */
+    @Volatile
+    var deliveryPolicy: DeliveryPolicy? = null
+
     // ===== Callbacks =====
 
     /** Callback for delivered messages */
@@ -1021,6 +1031,14 @@ class LXMRouter(
     internal fun ageTransferForTest(message: LXMessage, by: Long) {
         pendingResources[message]?.backdateActivityForTest(by)
     }
+
+    /**
+     * Test seam: replaces [Packet.prove] for the packet that delivered a message. Nothing leaves
+     * [Transport] while it is not started, so a test reads the proofs here instead. Null in
+     * production, where the packet proves itself.
+     */
+    @org.jetbrains.annotations.VisibleForTesting
+    internal var proveForTest: ((Packet) -> Unit)? = null
 
     /**
      * Process a single outbound message based on its delivery method.
@@ -1743,10 +1761,9 @@ class LXMRouter(
         link: Link,
         destHashHex: String,
     ) {
-        // Packet callback for receiving messages
+        // Packet callback for receiving messages. The packet is proven inside, once the message
+        // is admitted.
         link.setPacketCallback { data, packet ->
-            // Send proof back to sender for delivery confirmation
-            packet.prove()
             processInboundDelivery(data, DeliveryMethod.DIRECT, null, link, sourcePacket = packet)
         }
 
@@ -2225,17 +2242,16 @@ class LXMRouter(
     // ===== Inbound Message Handling =====
 
     /**
-     * Handle an incoming delivery packet.
+     * Handles an incoming delivery packet.
+     *
+     * The packet is proven by [processInboundDelivery], once the message is admitted. Python
+     * proves it first, before unpacking. See `port-deviations.md`.
      */
     private fun handleDeliveryPacket(
         data: ByteArray,
         destination: Destination,
         packet: Packet?,
     ) {
-        // CRITICAL: Send proof back to sender FIRST, before processing
-        // This is what triggers delivery confirmation on the sender side
-        packet?.prove()
-
         RnsLog.debug("LXMRouter") { "handleDeliveryPacket called with ${data.size} bytes for ${destination.hexHash}" }
         // For OPPORTUNISTIC delivery (single packet), the data doesn't include the
         // destination hash - we need to prepend it to match the LXMF message format.
@@ -2256,10 +2272,9 @@ class LXMRouter(
         link: Link,
         destination: Destination,
     ) {
-        // Set up link callbacks for packets
+        // Set up link callbacks for packets. The packet is proven inside, once the message is
+        // admitted.
         link.setPacketCallback { data, packet ->
-            // Send proof back to sender for delivery confirmation
-            packet.prove()
             processInboundDelivery(data, DeliveryMethod.DIRECT, destination, link, sourcePacket = packet)
         }
 
@@ -2310,32 +2325,69 @@ class LXMRouter(
     }
 
     /**
-     * Process an inbound LXMF delivery.
+     * Processes an inbound LXMF delivery.
      *
-     * @param data The raw message data
-     * @param method The delivery method used
-     * @param destination The destination that received the message
-     * @param link Optional link if this came via direct delivery
-     * @param sourcePacket Optional delivering packet. Provided for single-packet
-     *   paths (OPPORTUNISTIC and single-packet DIRECT). Not available for
-     *   Resource-delivered or propagation-fetched messages. Used to annotate
-     *   the resulting LXMessage with receive-time phy metadata (rssi, snr,
-     *   interface hash, hop count).
+     * [admitInbound] reads the message and decides whether it is delivered. [sourcePacket] is
+     * proven next, before the host sees the message, so a slow [deliveryCallback] does not delay
+     * the proof. Only a refusal by [deliveryPolicy] withholds the proof. Python proves the packet
+     * first, before unpacking. See `port-deviations.md`.
+     *
+     * @param data the raw message data.
+     * @param method the delivery method used.
+     * @param destination the destination that received the message.
+     * @param link the link the message came over, for a direct delivery.
+     * @param sourcePacket the packet that delivered the message, on the single-packet paths
+     *   (OPPORTUNISTIC, and a DIRECT message that fits one packet). It is proven here, and it
+     *   gives the message its receive-time phy metadata (rssi, snr, interface hash, hop count).
+     *   Null for a Resource, a propagated message and a paper message, which have no packet to
+     *   prove.
+     * @return what became of the message.
      */
     private fun processInboundDelivery(
         data: ByteArray,
         method: DeliveryMethod,
-        destination: Destination? = null,
         link: Link? = null,
         sourcePacket: Packet? = null,
-    ) {
+    ): InboundOutcome {
         RnsLog.debug("LXMRouter") { "processInboundDelivery called with ${data.size} bytes, method=$method" }
 
+        val outcome = admitInbound(data, method)
+
+        if (outcome.proves && sourcePacket != null) prove(sourcePacket)
+
+        if (outcome is InboundOutcome.Admitted) {
+            deliverInbound(outcome.message, data, method, link, sourcePacket)
+        }
+
+        return outcome
+    }
+
+    /** Proves [packet] to its sender, or hands it to [proveForTest] while a test has set one. */
+    private fun prove(packet: Packet) {
+        val override = proveForTest
+
+        if (override != null) override(packet) else packet.prove()
+    }
+
+    /**
+     * Reads an inbound message and decides whether it is delivered.
+     *
+     * The checks run in this order: the size limit, the decryption of a propagated message,
+     * unpacking, the signature, [deliveryPolicy], the duplicate check, the ignore list and the
+     * stamp. The policy comes before the duplicate check on purpose. A refused message is never
+     * remembered, so it is accepted once the policy allows its sender.
+     *
+     * @param data the raw message data.
+     * @param method the delivery method used.
+     * @return [InboundOutcome.Admitted] with the message, or why it was dropped.
+     */
+    private fun admitInbound(data: ByteArray, method: DeliveryMethod): InboundOutcome {
         // Enforce incoming message size limit
         val limitKb = incomingMessageSizeLimitKb
         if (limitKb != null && data.size > limitKb * 1024) {
             RnsLog.debug("LXMRouter") { "Rejecting oversized message: ${data.size} bytes > ${limitKb}KB limit" }
-            return
+
+            return InboundOutcome.Rejected
         }
 
         try {
@@ -2356,12 +2408,14 @@ class LXMRouter(
                         destHash + decryptedData
                     } else {
                         RnsLog.error("LXMRouter") { "Failed to decrypt propagated message for $destHashHex" }
-                        return
+
+                        return InboundOutcome.Rejected
                     }
                 } else {
                     // Not addressed to us — shouldn't happen in normal flow
                     RnsLog.debug("LXMRouter") { "Propagated message not for us: $destHashHex" }
-                    return
+
+                    return InboundOutcome.Rejected
                 }
             } else {
                 data
@@ -2371,31 +2425,13 @@ class LXMRouter(
             val message = LXMessage.unpackFromBytes(lxmfData, method)
             if (message == null) {
                 RnsLog.error("LXMRouter") { "Failed to unpack LXMF message" }
-                return
+
+                return InboundOutcome.Rejected
             }
             RnsLog.debug("LXMRouter") { "Unpacked message from ${message.sourceHash.toHexString()}" }
 
             message.incoming = true
             message.method = method
-
-            // Check for duplicates. Dedup on message.hash (full hash of
-            // destination_hash + source_hash + payload-without-stamp), which
-            // is set unconditionally by LXMessage.unpackFromBytes:763. The
-            // older code checked transientId, but transientId is only
-            // populated on the SENDER side during outbound packing for
-            // propagation (LXMessage.kt outbound → LXMessage.py:439); on the
-            // incoming path it's always null, so the dedup check was a
-            // perpetual no-op. This let DIRECT-delivery LXMessages large
-            // enough to trigger Resource transfer (>319 bytes) deliver
-            // twice — once via setPacketCallback firing on the final chunk,
-            // once via setResourceConcludedCallback firing on assembly. See
-            // LXMF-kt#8. Matches Python LXMRouter.py:1788/1792 which uses
-            // message.hash as the locally_delivered_transient_ids key.
-            val dedupKey = message.hash?.toHexString()
-            if (dedupKey != null && locallyDeliveredTransientIds.containsKey(dedupKey)) {
-                RnsLog.debug("LXMRouter") { "Duplicate message detected, ignoring" }
-                return
-            }
 
             // Validate signature if possible
             if (!message.signatureValidated) {
@@ -2406,7 +2442,8 @@ class LXMRouter(
                     }
                     UnverifiedReason.SIGNATURE_INVALID -> {
                         RnsLog.warn("LXMRouter") { "Message signature invalid, rejecting" }
-                        return
+
+                        return InboundOutcome.Rejected
                     }
                     null -> {
                         // No error, signature validated
@@ -2414,11 +2451,32 @@ class LXMRouter(
                 }
             }
 
+            // Ask the host before anything is remembered, so a refusal leaves no trace and the
+            // same message is accepted once the host allows its sender.
+            val policy = deliveryPolicy
+
+            if (policy != null && !policy.admits(message.sourceHash, message.fields)) {
+                RnsLog.debug("LXMRouter") { "Delivery policy refused a message from ${message.sourceHash.toHexString()}" }
+
+                return InboundOutcome.RefusedByPolicy
+            }
+
+            // Check for duplicates on message.hash, as python does (LXMRouter.py:1788/1792).
+            // transientId is set on the sender side only, so it is always null here; see LXMF-kt#8.
+            val dedupKey = message.hash?.toHexString()
+
+            if (dedupKey != null && locallyDeliveredTransientIds.containsKey(dedupKey)) {
+                RnsLog.debug("LXMRouter") { "Duplicate message detected, ignoring" }
+
+                return InboundOutcome.Duplicate
+            }
+
             // Check ignored list (access control)
             val sourceHashHexForCheck = message.sourceHash.toHexString()
             if (ignoredList.any { it.toHexString() == sourceHashHexForCheck }) {
                 RnsLog.debug("LXMRouter") { "Ignored message from $sourceHashHexForCheck" }
-                return
+
+                return InboundOutcome.Rejected
             }
 
             // Validate stamp if required (PAPER messages bypass stamp enforcement)
@@ -2436,11 +2494,42 @@ class LXMRouter(
                         RnsLog.warn("LXMRouter") { "Message from $sourceHashHexForCheck has invalid stamp, but allowing (PAPER delivery)" }
                     } else {
                         RnsLog.error("LXMRouter") { "Message from $sourceHashHexForCheck failed stamp validation (required cost: $requiredCost)" }
-                        return
+
+                        return InboundOutcome.Rejected
                     }
                 }
             }
 
+            return InboundOutcome.Admitted(message)
+        } catch (e: Exception) {
+            RnsLog.error("LXMRouter") { "Error reading inbound delivery: ${e.message}" }
+
+            return InboundOutcome.Rejected
+        }
+    }
+
+    /**
+     * Hands an admitted message to the host.
+     *
+     * Remembers the sender's identity from [link], records the message's transient ids so a
+     * repeat is dropped, gives the message its receive-time phy metadata, and calls
+     * [deliveryCallback].
+     *
+     * @param message the admitted message.
+     * @param data the raw message data. Its hash is the wire transient id of a propagated or
+     *   paper message.
+     * @param method the delivery method used.
+     * @param link the link the message came over, for a direct delivery.
+     * @param sourcePacket the packet that delivered the message, on the single-packet paths.
+     */
+    private fun deliverInbound(
+        message: LXMessage,
+        data: ByteArray,
+        method: DeliveryMethod,
+        link: Link?,
+        sourcePacket: Packet?,
+    ) {
+        try {
             // Store the sender's identity for replies. The link itself is not made a backchannel
             // here: as in Python, a link becomes one only when its remote identifies on it
             // (`delivery_remote_identified`), which [handleDeliveryLinkEstablished] handles. A
@@ -2475,8 +2564,8 @@ class LXMRouter(
             // way the launched save coroutine reads a complete map at
             // execution time and a single file rewrite captures both
             // entries (vs two saves where the first could race ahead of
-            // the second write). See dedupKey computation above for the
-            // message.hash rationale, and #15 for the wire-source key
+            // the second write). See the duplicate check in [admitInbound] for
+            // the message.hash rationale, and #15 for the wire-source key
             // rationale (mirrors Python LXMRouter.py:1792 + 2320 — both
             // keys coexist in the heterogeneous-key dedup map).
             //
@@ -2496,7 +2585,7 @@ class LXMRouter(
             //     inner message.hash dedup.
             val nowSeconds = System.currentTimeMillis() / 1000
             var anyKeyWritten = false
-            dedupKey?.let {
+            message.hash?.toHexString()?.let {
                 locallyDeliveredTransientIds[it] = nowSeconds
                 anyKeyWritten = true
             }

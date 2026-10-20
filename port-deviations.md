@@ -162,3 +162,21 @@ What "stalled" means changed on 2026-10-13. The rule used to measure from the se
 The rule now measures from the Resource's own last activity, `Resource.lastActivityAt`, which reticulum-kt exposes from 0.2.3. That is the clock the Resource's watchdog measures idle time from. It moves when the Resource advertises, and whenever a part or a hashmap update goes out. A Resource in `QUEUED`, waiting its turn on the link, is never stalled. Its clock moves when the link takes it. A node upload still making its stamp has no Resource yet. It is measured from the moment it was set `SENDING`, as before.
 
 **Re-evaluation:** If the Resource watchdog's own cancel is trusted to reach the router in every case, the rule can go, and the port matches python here.
+
+### Delivery policy, and the proof after admission — `lxmf-core/src/main/kotlin/network/reticulum/lxmf/LXMRouter.kt::deliveryPolicy`, `::processInboundDelivery`, `::admitInbound`; `DeliveryPolicy.kt`; `InboundOutcome.kt`
+
+**Python reference:** `LXMF/LXMF/LXMRouter.py::delivery_packet` (lines 1817-1818) proves the packet first, then unpacks it. `::lxmf_delivery` checks `self.ignored_list` after the signature check, and drops a message on it with the proof already sent.
+
+**Category:** new feature
+
+**Date:** 2026-10-20
+
+**Tracking:** Analog FEATURE-67, phase 1. LXMF-swift has the same change: `LXMRouter.swift::setDeliveryPolicy`, its `port-deviations.md` entry "host delivery policy, proof after admission", and `KVF-divergence.md` D12.
+
+**Description:** The host installs a `DeliveryPolicy` as `LXMRouter.deliveryPolicy`. The router asks it with the source hash and the fields, after the message is unpacked and its signature checked, and before the duplicate check, the ignore list, the stamp, the delivery and the proof. A refused message is not proven, not delivered and not remembered. So the same message is accepted once the policy allows its sender. Without a policy nothing changes. `ignored_list` is untouched, and is still checked after the policy. The duplicate check used to run before the signature check. It now runs after it, so the policy sits between the two, as in LXMF-swift.
+
+The proof moved. `delivery_packet` and the two link packet callbacks proved before unpacking. Now `processInboundDelivery` proves the delivering packet once `admitInbound` has answered, and before `deliveryCallback` runs, so a slow host does not delay it. Every outcome but a policy refusal still proves. A duplicate, an unreadable message, a bad signature, an ignored source and a bad stamp prove as in python, so a sender whose first proof was lost is not left retrying.
+
+Two paths prove whatever the policy says. A message that arrives as a Resource is proven by reticulum-kt itself: `Resource.assemble` sends the resource proof right after it calls `Link.resourceConcluded`, whatever the concluded callback did. LXMF-swift leaves it so, and so does this port. A refused Resource is proven and not delivered. A message pulled from a propagation node has no packet to prove. The pull acknowledges every transient id it received, so a refused message is deleted from the node for good. That is the intended outcome for a blocked or unknown sender.
+
+**Re-evaluation:** If python gains a host admission hook, align the name and the order with it. The proof order stays a deviation for as long as python proves first.
