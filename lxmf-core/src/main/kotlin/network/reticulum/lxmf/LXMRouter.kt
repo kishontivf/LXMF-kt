@@ -599,7 +599,7 @@ class LXMRouter(
 
         // Set up link established callback
         destination.setLinkEstablishedCallback { link ->
-            handleDeliveryLinkEstablished(link as Link, destination)
+            handleDeliveryLinkEstablished(link as Link)
         }
 
         // Set default app data for announcements
@@ -1764,7 +1764,7 @@ class LXMRouter(
         // Packet callback for receiving messages. The packet is proven inside, once the message
         // is admitted.
         link.setPacketCallback { data, packet ->
-            processInboundDelivery(data, DeliveryMethod.DIRECT, null, link, sourcePacket = packet)
+            processInboundDelivery(data, DeliveryMethod.DIRECT, link, sourcePacket = packet)
         }
 
         // Enable app-controlled resource acceptance for LXMF messages
@@ -1846,7 +1846,7 @@ class LXMRouter(
         }
 
         // Process as inbound LXMF delivery
-        processInboundDelivery(data, DeliveryMethod.DIRECT, null, link)
+        processInboundDelivery(data, DeliveryMethod.DIRECT, link)
     }
 
     /**
@@ -2262,20 +2262,17 @@ class LXMRouter(
 
         // Process the delivery. `packet` carries the receive-time phy metadata
         // (rssi/snr/interface/hops) we want to surface on the LXMessage.
-        processInboundDelivery(lxmfData, method, destination, sourcePacket = packet)
+        processInboundDelivery(lxmfData, method, sourcePacket = packet)
     }
 
     /**
      * Handle a new delivery link being established.
      */
-    private fun handleDeliveryLinkEstablished(
-        link: Link,
-        destination: Destination,
-    ) {
+    private fun handleDeliveryLinkEstablished(link: Link) {
         // Set up link callbacks for packets. The packet is proven inside, once the message is
         // admitted.
         link.setPacketCallback { data, packet ->
-            processInboundDelivery(data, DeliveryMethod.DIRECT, destination, link, sourcePacket = packet)
+            processInboundDelivery(data, DeliveryMethod.DIRECT, link, sourcePacket = packet)
         }
 
         // Enable app-controlled resource acceptance for LXMF messages

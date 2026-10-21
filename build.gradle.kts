@@ -5,7 +5,7 @@ plugins {
 
 allprojects {
     group = "com.github.kishontivf.LXMF-kt"
-    version = System.getenv("VERSION")?.removePrefix("v") ?: "0.4.0"
+    version = System.getenv("VERSION")?.removePrefix("v") ?: "0.4.1"
 }
 
 subprojects {
